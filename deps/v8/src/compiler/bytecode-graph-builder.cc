@@ -2746,6 +2746,21 @@ void BytecodeGraphBuilder::VisitCallRuntime() {
     Node* value = environment()->LookupRegister(receiver);
     observe_node_info_.StartObserving(value);
     environment()->BindAccumulator(value);
+  } else if (function_id == Runtime::kTraceEnter ||
+             function_id == Runtime::kTraceAsyncSuspend ||
+             function_id == Runtime::kTraceAsyncResume) {
+    // Trace hooks are intentionally omitted from TurboFan-compiled code.
+    // The incq counter injected into the function prologue (code-generator.cc)
+    // replaces per-call tracing for JIT'd functions.
+    environment()->BindAccumulator(jsgraph()->UndefinedConstant(),
+                                   Environment::kAttachFrameState);
+  } else if (function_id == Runtime::kTraceExit) {
+    // TraceExit receives the return value and passes it through unchanged.
+    // Skip the call and bind the argument register directly to the accumulator
+    // so the subsequent Return bytecode sees the correct value.
+    DCHECK_EQ(1, reg_count);
+    Node* value = environment()->LookupRegister(receiver);
+    environment()->BindAccumulator(value, Environment::kAttachFrameState);
   } else {
     // Create node to perform the runtime call.
     const Operator* call = javascript()->CallRuntime(function_id, reg_count);
