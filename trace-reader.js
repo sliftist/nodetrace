@@ -5,31 +5,35 @@
 
 const fs = require('fs');
 
-// ── Wire format constants ──────────────────────────────────────────────────────
-
-const T_UINT8    = 0x01;
-const T_UINT16   = 0x02;
-const T_UINT32   = 0x03;
-const T_UINT64   = 0x04;
-const T_STRING   = 0x10;
-const T_FUNCNAME = 0x11;  // string + push to name cache
-const T_FUNCREF  = 0x12;  // 1-byte back-distance into name cache
-
 const EV_ENTER    = 0x00;
 const EV_EXIT     = 0x01;
 const EV_SUSPEND  = 0x02;
 const EV_RESUME   = 0x03;
 const EV_OSR      = 0x04;
-const EV_TURBOFAN = 0x05;  // N TurboFan calls since the last Ignition event
+const EV_TURBOFAN = 0x05;
 
 const EV_NAME = ['ENTER', 'EXIT', 'SUSPEND', 'RESUME', 'OSR', 'TURBOFAN'];
 
 // ── Binary reader ──────────────────────────────────────────────────────────────
+// Format: flat stream of records, no per-field tags.
+//   Header byte: [ss:2 | type:6]
+//     ss=0 → 1-byte delta, ss=1 → 2-byte, ss=2 → 4-byte, ss=3 → 8-byte
+//   Delta timestamp (LE, ss bytes) added to running absolute timestamp
+//   Fixed fields per type (no tags):
+//     ENTER:    func(name-field), is_async(u8), call_id(u32)
+//     EXIT:     func(name-field), call_id(u32)
+//     SUSPEND:  func(name-field), call_id(u32)
+//     RESUME:   func(name-field), call_id(u32)
+//     OSR:      func(name-field), call_id(u32)
+//     TURBOFAN: count(u32)
+//   Name field: byte=0 → new name (u16 len + utf-8, pushed to ring cache)
+//               byte 1-128 → cache back-ref (1=most recent)
 
 function readTrace(buf) {
   let pos = 0;
-  const nameCache = [];   // ring: index 0 = most-recently seen name
+  const nameCache = [];
   const events = [];
+  let lastTs = 0n;
 
   const u8  = () => buf[pos++];
   const u16 = () => { const v = buf.readUInt16LE(pos); pos += 2; return v; };
@@ -40,36 +44,52 @@ function readTrace(buf) {
     pos += 8;
     return BigInt(hi) * 0x100000000n + BigInt(lo);
   };
-  const str = () => { const len = u16(); const s = buf.toString('utf8', pos, pos + len); pos += len; return s; };
+
+  const readDelta = (ss) => {
+    switch (ss) {
+      case 0: return BigInt(u8());
+      case 1: return BigInt(u16());
+      case 2: return BigInt(u32());
+      case 3: return u64();
+    }
+  };
+
+  const readFunc = () => {
+    const prefix = u8();
+    if (prefix === 0) {
+      const len = u16();
+      const name = buf.toString('utf8', pos, pos + len);
+      pos += len;
+      nameCache.unshift(name);
+      if (nameCache.length > 128) nameCache.pop();
+      return name;
+    }
+    return nameCache[prefix - 1] ?? '(unknown)';
+  };
 
   while (pos < buf.length) {
-    const nFields = u8();
-    const vals = [];
+    const header = u8();
+    const ss   = (header >> 6) & 0x03;
+    const type = header & 0x3F;
 
-    for (let i = 0; i < nFields; i++) {
-      const tag = u8();
-      if      (tag === T_UINT8)    vals.push(u8());
-      else if (tag === T_UINT16)   vals.push(u16());
-      else if (tag === T_UINT32)   vals.push(u32());
-      else if (tag === T_UINT64)   vals.push(u64());
-      else if (tag === T_STRING)   vals.push(str());
-      else if (tag === T_FUNCNAME) { const n = str(); nameCache.unshift(n); if (nameCache.length > 128) nameCache.pop(); vals.push(n); }
-      else if (tag === T_FUNCREF)  { const d = u8(); vals.push(nameCache[d - 1] ?? '(unknown)'); }
-      else { throw new Error(`Unknown field tag 0x${tag.toString(16)} at offset ${pos}`); }
-    }
+    const delta = readDelta(ss);
+    lastTs += delta;
+    const ts = lastTs;
 
-    // vals layout:
-    //   ENTER:         [evType, ts, funcName, isAsync, callId]
-    //   EXIT/etc:      [evType, ts, funcName, callId]
-    //   TURBOFAN_BATCH:[evType, ts, count]
-    const [evType, ts, ...rest] = vals;
-    if (evType === EV_ENTER) {
-      events.push({ type: 'ENTER', ts, func: rest[0], isAsync: !!rest[1], callId: rest[2] });
-    } else if (evType === EV_TURBOFAN) {
-      // rest = [tsEnd, count]  (ts = ts_start of the window)
-      events.push({ type: 'TURBOFAN', ts, tsEnd: rest[0], count: rest[1] });
+    if (type === EV_ENTER) {
+      const func    = readFunc();
+      const isAsync = u8();
+      const callId  = u32();
+      events.push({ type: 'ENTER', ts, func, isAsync: !!isAsync, callId });
+    } else if (type === EV_TURBOFAN) {
+      const count = BigInt(u32());
+      events.push({ type: 'TURBOFAN', ts, count });
+    } else if (type <= EV_OSR) {
+      const func   = readFunc();
+      const callId = u32();
+      events.push({ type: EV_NAME[type], ts, func, callId });
     } else {
-      events.push({ type: EV_NAME[evType] ?? `0x${evType.toString(16)}`, ts, func: rest[0], callId: rest[1] });
+      throw new Error(`Unknown event type 0x${type.toString(16)} at offset ${pos}`);
     }
   }
 
@@ -79,14 +99,12 @@ function readTrace(buf) {
 // ── Analysis ───────────────────────────────────────────────────────────────────
 
 function summarize(events) {
-  // Use null-prototype objects so names like 'toString' or 'constructor' don't
-  // shadow Object.prototype properties and corrupt the accumulators.
   const counts    = Object.create(null);
-  const wallNs    = Object.create(null);  // total wall time per function (ENTER→EXIT)
-  const callCount = Object.create(null);  // how many times each function was entered
-  const osrCount  = Object.create(null);  // how many OSR handoffs per function name
-  const stack = [];                       // { func, ts, callId }
-  let turboFanTotal = 0n;  // total TurboFan calls across all batches
+  const wallNs    = Object.create(null);
+  const callCount = Object.create(null);
+  const osrCount  = Object.create(null);
+  const stack = [];
+  let turboFanTotal = 0n;
 
   for (const ev of events) {
     counts[ev.type] = (counts[ev.type] ?? 0) + 1;
@@ -95,7 +113,6 @@ function summarize(events) {
       stack.push({ func: ev.func, ts: ev.ts, callId: ev.callId });
       callCount[ev.func] = (callCount[ev.func] ?? 0) + 1;
     } else if (ev.type === 'EXIT') {
-      // Find the matching frame by callId (handles recursion correctly)
       const idx = stack.findLastIndex(f => f.callId === ev.callId);
       if (idx >= 0) {
         const { func, ts } = stack.splice(idx, 1)[0];
@@ -144,7 +161,7 @@ const top = Object.entries(wallNs)
 console.log('\nTop 25 functions by total wall time (Ignition only):');
 console.log(`  ${'ms'.padStart(12)}  ${'calls'.padStart(8)}  ${'osr'.padStart(5)}  name`);
 for (const [fn, ns] of top) {
-  const ms   = (ns / 1e6).toFixed(2).padStart(12);
+  const ms    = (ns / 1e6).toFixed(2).padStart(12);
   const calls = (callCount[fn] ?? 0).toLocaleString().padStart(8);
   const osr   = (osrCount[fn] ?? 0).toLocaleString().padStart(5);
   console.log(`  ${ms}  ${calls}  ${osr}  ${fn}`);

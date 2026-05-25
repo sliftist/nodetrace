@@ -30,128 +30,109 @@ Four new runtime functions handle the events:
 Each function calls `MaybeInitTraceWriter()` which lazily opens the output file
 on first call (skipped entirely in `mksnapshot` to avoid bootstrapping issues).
 
-### TurboFan OSR (`deps/v8/src/runtime/runtime-compiler.cc`)
+### TurboFan hook stripping (`deps/v8/src/compiler/bytecode-graph-builder.cc`)
 
-When Ignition hands a hot function off to TurboFan mid-loop (OSR), the normal
-TraceExit will still fire from TurboFan's Return. To mark the handoff point,
-`Runtime_LogOrTraceOptimizedOSREntry` is hooked to emit a `FUNC_OSR` event.
-The `--node-trace-funcs` flag sets `v8_flags.log_or_trace_osr` at init time so
-this builtin is called.
+When TurboFan compiles a hot function it strips the `CallRuntime(TraceEnter/Exit)`
+bytecodes completely — they are replaced with no-ops. This means **JIT-compiled
+functions run with zero tracing overhead**. Their call counts are still tracked
+via a single `incq` counter at the JIT'd function prologue (see TURBOFAN_BATCH).
+
+### TurboFan prologue counter (`deps/v8/src/compiler/code-generator.cc`)
+
+A single `incq` instruction is injected at the entry of every TurboFan-compiled
+function. This increments `g_turbofan_call_count`. Before each Ignition trace
+event, the counter is drained into a `TURBOFAN_BATCH` record if non-zero.
 
 ### Compiler flags (`deps/v8/src/flags/flag-definitions.h`)
 
-- Maglev and Sparkplug (baseline JIT) are disabled by default — they bypass
-  Ignition and would miss trace calls.
-- `turbo_filter` defaults to `"heavyCompute"` so TurboFan only kicks in for
-  functions you explicitly opt in to, keeping most code in Ignition where the
-  trace hooks live.
+- Maglev and Sparkplug (baseline JIT) are disabled — they bypass Ignition and
+  would miss the trace hooks before the function gets fully JIT-compiled.
+- `turbo_filter` is `"*"` — V8 naturally JITs hot functions as it normally would.
+  Hot functions run at full speed with zero tracing overhead; only Ignition
+  functions (cold or below the JIT threshold) are traced.
 
-### Trace writer (`deps/v8/src/trace/trace-writer.h`, `trace-writer.cc`)
+### Trace writer (`deps/v8/src/trace/trace-writer.h`)
 
 `TraceWriter` is a lightweight, header-only class:
 
-- **128 MB malloc'd ring buffer** flushed to disk in chunks; physical pages are
-  only committed as written.
-- **Binary wire format**: each record is `[uint8 n_fields][field*]`. Fields are
-  typed (UINT8, UINT64, STRING, FUNC_NAME, FUNC_REF). See the header for the
-  full format spec.
-- **Function-name deduplication**: a 128-entry ring cache maps SFI pointer →
-  cache slot. Repeated calls to the same function emit a 2-byte `FUNC_REF`
-  instead of the full name string.
-- **Async call tracking**: `call_stack_` (a `std::vector<uint32_t>`) pairs each
-  ENTER with a unique `call_id`. SUSPEND pops the id into `suspended_calls_`
-  (keyed on generator identity hash); RESUME pushes it back so EXIT sees the
-  correct id.
-- **Thread safety**: single-threaded by design — one writer per process,
-  accessed only from the V8 main thread via `g_trace_writer`.
+- **128 MB malloc'd ring buffer** flushed to disk in chunks.
+- **Compact binary wire format** (see below): delta-encoded variable-width
+  timestamps, no per-field tags, 128-entry function-name ring cache.
+- **Async call tracking**: `call_stack_` pairs each ENTER with a unique
+  `call_id`. SUSPEND pops the id into `suspended_calls_` (keyed on generator
+  identity hash); RESUME pushes it back so EXIT sees the correct id.
+- **Thread safety**: single-threaded by design — one writer per process.
 
 ## Output
 
-Tracing is **opt-in**: set `NODE_TRACE_FILE=<path>` to enable it.  If the
-variable is not set the process runs with zero overhead (no file is opened, no
-trace hooks fire).  Set it to `/dev/null` if you want to exercise the write
-path without storing output.
+Tracing is **opt-in**: set `NODE_TRACE_FILE=<path>` to enable it. If the
+variable is not set the process runs with zero overhead. Set it to `/dev/null`
+to exercise the write path without storing output.
 
-Decode with `trace-reader.js` (in the repo root).
-
-## Design: tracing overhead and JIT interaction
-
-- All trace hooks are injected as `CallRuntime(TraceEnter/Exit)` bytecodes by
-  `bytecode-generator.cc`.  Every function call in Ignition fires these hooks.
-- TurboFan **preserves** those `CallRuntime` bytecodes when it compiles a
-  function, so `TraceEnter`/`TraceExit` still fire from JIT-compiled code.
-  This means **every call is captured in the trace**, whether Ignition or JIT'd.
-  Calls are never silently dropped.
-- JIT'd functions are still faster: TurboFan compiles the function body to
-  native code, so the total time per call drops significantly even though the
-  tracing overhead (a runtime call per entry/exit) is similar in absolute ns.
-  Empirically, simple functions see ~7× speedup under JIT with tracing active.
-- Maglev and Sparkplug (baseline JIT) are disabled to avoid a middle tier
-  that bypasses the injected `CallRuntime` calls.
-
-### TURBOFAN_BATCH events
-
-In addition to the standard ENTER/EXIT trace, a single `incq` instruction is
-injected at the entry of every TurboFan-compiled function (in `code-generator.cc`).
-This increments a global counter `g_turbofan_call_count`.  Before each Ignition
-trace event (ENTER/EXIT/SUSPEND/RESUME), the counter is drained and emitted as
-a `TURBOFAN_BATCH` event if non-zero.
-
-This lets you see **which calls were JIT'd** in the trace stream without adding
-per-call overhead to the main trace path:
-
-- `TURBOFAN_BATCH(N)` immediately before `ENTER(f)` means the immediately
-  preceding N function calls (since the last traced event) went through
-  TurboFan code.  Because TurboFan also fires TraceEnter, those N calls will
-  also produce ENTER events; the batch count confirms they were JIT'd.
+```
+NODE_TRACE_FILE=my_trace.bin node my_program.js
+node trace-reader.js my_trace.bin
+node analyze-trace.js my_trace.bin
+```
 
 ## Wire format reference
 
-The binary trace is a flat stream of records.  See
-`deps/v8/src/trace/trace-writer.h` for the authoritative spec; this is a
-summary for readers.
+The binary trace is a flat stream of records. Records never cross a flush
+boundary. See `deps/v8/src/trace/trace-writer.h` for the authoritative spec.
 
 ### Record layout
 
 ```
-[uint8  n_fields]
-[field] × n_fields
+[uint8  header]   bits 7-6: ss (timestamp size selector)
+                  bits 5-0: type (event type, 0x00–0x05)
+[delta]           timestamp delta from previous record, LE
+                  ss=0 → 1 byte, ss=1 → 2 bytes, ss=2 → 4 bytes, ss=3 → 8 bytes
+[fields]          fixed layout per type — no per-field tags
 ```
 
-### Field tags
+The absolute timestamp is the running sum of all deltas since t=0.
+Consecutive events typically differ by < 255 ns, so the delta fits in 1 byte.
 
-| Tag  | Name       | Payload               |
-|------|------------|-----------------------|
-| 0x01 | UINT8      | 1-byte value          |
-| 0x02 | UINT16     | 2-byte LE             |
-| 0x03 | UINT32     | 4-byte LE             |
-| 0x04 | UINT64     | 8-byte LE             |
-| 0x10 | STRING     | uint16-LE len + bytes |
-| 0x11 | FUNC_NAME  | same as STRING; reader pushes name onto a 128-entry ring cache |
-| 0x12 | FUNC_REF   | 1-byte distance (1 = most-recently-pushed name) |
+### Function name field (used in ENTER/EXIT/SUSPEND/RESUME/OSR)
 
-### Event types (first field of every record, UINT8)
+```
+[uint8 prefix]
+  0        → new name: [uint16-LE len][utf-8 bytes], pushed to 128-entry ring cache
+  1..128   → cache ref: distance (1 = most-recently-seen name)
+```
 
-| Value | Name           | Fields                                     |
-|-------|----------------|--------------------------------------------|
-| 0x00  | FUNC_ENTER     | evType, ts(u64), func, is_async(u8), call_id(u32) |
-| 0x01  | FUNC_EXIT      | evType, ts(u64), func, call_id(u32)        |
-| 0x02  | ASYNC_SUSPEND  | evType, ts(u64), func, call_id(u32)        |
-| 0x03  | ASYNC_RESUME   | evType, ts(u64), func, call_id(u32)        |
-| 0x04  | FUNC_OSR       | evType, ts(u64), func, call_id(u32)        |
-| 0x05  | TURBOFAN_BATCH | evType, ts_start(u64), ts_end(u64), count(u64) |
+### Event types
+
+| Value | Name           | Fields after header+delta                       |
+|-------|----------------|-------------------------------------------------|
+| 0x00  | FUNC_ENTER     | func(name-field), is_async(u8), call_id(u32-LE) |
+| 0x01  | FUNC_EXIT      | func(name-field), call_id(u32-LE)               |
+| 0x02  | ASYNC_SUSPEND  | func(name-field), call_id(u32-LE)               |
+| 0x03  | ASYNC_RESUME   | func(name-field), call_id(u32-LE)               |
+| 0x04  | FUNC_OSR       | func(name-field), call_id(u32-LE)               |
+| 0x05  | TURBOFAN_BATCH | count(u32-LE)                                   |
 
 `call_id` is a process-global uint32 counter incremented on every ENTER.
 SUSPEND/RESUME/EXIT carry the same `call_id` as their matching ENTER.
 
-### Decoding (`trace-reader.js`)
+For TURBOFAN_BATCH: `ts` in the header is the end of the JIT window;
+`ts_start` is implicitly the previous record's timestamp.
+
+### Approximate record sizes (delta fits in 1 byte — typical)
+
+| Event                   | Size |
+|-------------------------|------|
+| ENTER (cached name)     | 8 B  |
+| ENTER (new name, len N) | 10+N B |
+| EXIT/SUSPEND/RESUME/OSR (cached) | 7 B |
+| TURBOFAN_BATCH          | 6 B  |
+
+### Decoding
 
 ```
-node trace-reader.js [path/to/trace.bin]
+node trace-reader.js [path/to/trace.bin]   # full event dump + wall-time table
+node analyze-trace.js [path/to/trace.bin]  # own-time analysis, top 3 functions
 ```
-
-Prints: event-type breakdown, total Ignition vs TurboFan calls, and the top 25
-functions by total wall time with call counts and OSR handoff counts.
 
 ## Runtime declarations (`deps/v8/src/runtime/runtime.h`)
 

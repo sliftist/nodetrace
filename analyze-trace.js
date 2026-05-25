@@ -1,44 +1,85 @@
 'use strict';
 const fs = require('fs');
 
-const T_UINT8=0x01,T_UINT16=0x02,T_UINT32=0x03,T_UINT64=0x04;
-const T_STRING=0x10,T_FUNCNAME=0x11,T_FUNCREF=0x12;
-const EV_ENTER=0x00,EV_EXIT=0x01,EV_SUSPEND=0x02,EV_RESUME=0x03,EV_OSR=0x04,EV_TURBOFAN=0x05;
+const EV_ENTER    = 0x00;
+const EV_EXIT     = 0x01;
+const EV_SUSPEND  = 0x02;
+const EV_RESUME   = 0x03;
+const EV_OSR      = 0x04;
+const EV_TURBOFAN = 0x05;
 
 function readTrace(buf) {
   let pos = 0;
   const nameCache = [];
   const events = [];
+  let lastTs = 0n;
+
   const u8  = () => buf[pos++];
   const u16 = () => { const v = buf.readUInt16LE(pos); pos += 2; return v; };
   const u32 = () => { const v = buf.readUInt32LE(pos); pos += 4; return v; };
-  const u64 = () => { const lo = buf.readUInt32LE(pos), hi = buf.readUInt32LE(pos+4); pos+=8; return BigInt(hi)*0x100000000n+BigInt(lo); };
-  const str = () => { const len = u16(); const s = buf.toString('utf8', pos, pos+len); pos+=len; return s; };
-  while (pos < buf.length) {
-    const nf = u8(); const vals = [];
-    for (let i = 0; i < nf; i++) {
-      const tag = u8();
-      if      (tag===T_UINT8)    vals.push(u8());
-      else if (tag===T_UINT16)   vals.push(u16());
-      else if (tag===T_UINT32)   vals.push(u32());
-      else if (tag===T_UINT64)   vals.push(u64());
-      else if (tag===T_STRING)   vals.push(str());
-      else if (tag===T_FUNCNAME) { const n=str(); nameCache.unshift(n); if(nameCache.length>128)nameCache.pop(); vals.push(n); }
-      else if (tag===T_FUNCREF)  { const d=u8(); vals.push(nameCache[d-1]??'(unknown)'); }
+  const u64 = () => {
+    const lo = buf.readUInt32LE(pos);
+    const hi = buf.readUInt32LE(pos + 4);
+    pos += 8;
+    return BigInt(hi) * 0x100000000n + BigInt(lo);
+  };
+
+  const readDelta = (ss) => {
+    switch (ss) {
+      case 0: return BigInt(u8());
+      case 1: return BigInt(u16());
+      case 2: return BigInt(u32());
+      case 3: return u64();
     }
-    const [evType, ts, ...rest] = vals;
-    if      (evType===EV_ENTER)    events.push({type:'ENTER',   ts, func:rest[0], isAsync:!!rest[1], callId:rest[2]});
-    else if (evType===EV_TURBOFAN) events.push({type:'TURBOFAN',ts, tsEnd:rest[0], count:rest[1]});
-    else                           events.push({type:['ENTER','EXIT','SUSPEND','RESUME','OSR'][evType]??`0x${evType.toString(16)}`, ts, func:rest[0], callId:rest[1]});
+  };
+
+  const readFunc = () => {
+    const prefix = u8();
+    if (prefix === 0) {
+      const len = u16();
+      const name = buf.toString('utf8', pos, pos + len);
+      pos += len;
+      nameCache.unshift(name);
+      if (nameCache.length > 128) nameCache.pop();
+      return name;
+    }
+    return nameCache[prefix - 1] ?? '(unknown)';
+  };
+
+  while (pos < buf.length) {
+    const header = u8();
+    const ss   = (header >> 6) & 0x03;
+    const type = header & 0x3F;
+
+    const delta = readDelta(ss);
+    lastTs += delta;
+    const ts = lastTs;
+
+    if (type === EV_ENTER) {
+      const func    = readFunc();
+      const isAsync = u8();
+      const callId  = u32();
+      events.push({ type: 'ENTER', ts, func, isAsync: !!isAsync, callId });
+    } else if (type === EV_TURBOFAN) {
+      const count = BigInt(u32());
+      events.push({ type: 'TURBOFAN', ts, count });
+    } else if (type <= EV_OSR) {
+      const func   = readFunc();
+      const callId = u32();
+      events.push({ type: ['ENTER','EXIT','SUSPEND','RESUME','OSR'][type], ts, func, callId });
+    } else {
+      throw new Error(`Unknown event type 0x${type.toString(16)} at offset ${pos}`);
+    }
   }
+
   return events;
 }
 
 function analyze(events) {
-  const callInfo  = Object.create(null); // callId -> {func, enterTs, exitTs, parentId, activeNs}
-  const stack     = [];                  // [{callId, func, enterTs}]
-  const ownNs     = Object.create(null); // func -> total own nanoseconds
-  const callCount = Object.create(null); // func -> call count
+  const callInfo  = Object.create(null);
+  const stack     = [];
+  const ownNs     = Object.create(null);
+  const callCount = Object.create(null);
   const uniqueFuncs = new Set();
   let turboFanTotal = 0n;
 
@@ -49,28 +90,23 @@ function analyze(events) {
       uniqueFuncs.add(ev.func);
       callCount[ev.func] = (callCount[ev.func] ?? 0) + 1;
       const parentId = stack.length > 0 ? stack[stack.length-1].callId : null;
-      callInfo[ev.callId] = { func: ev.func, enterTs: ev.ts, exitTs: null, parentId, childNs: 0n };
-      stack.push({ callId: ev.callId, func: ev.func, enterTs: ev.ts });
+      callInfo[ev.callId] = { func: ev.func, enterTs: ev.ts, parentId, childNs: 0n };
+      stack.push({ callId: ev.callId, func: ev.func });
     } else if (ev.type === 'EXIT') {
       const info = callInfo[ev.callId];
       if (!info) continue;
       const dur = ev.ts - info.enterTs;
-      // own time = total duration minus time attributed to children
       const own = dur - info.childNs;
       ownNs[info.func] = (ownNs[info.func] ?? 0n) + (own > 0n ? own : 0n);
-      // credit parent with this call's total duration
       if (info.parentId != null && callInfo[info.parentId]) {
         callInfo[info.parentId].childNs += dur;
       }
-      // pop stack
       const idx = stack.findLastIndex(f => f.callId === ev.callId);
       if (idx >= 0) stack.splice(idx, 1);
       delete callInfo[ev.callId];
     } else if (ev.type === 'SUSPEND') {
-      // treat suspend as a temporary exit: credit parent with time so far
       const info = callInfo[ev.callId];
       if (!info) continue;
-      info._suspendTs = ev.ts;
       const dur = ev.ts - info.enterTs;
       if (info.parentId != null && callInfo[info.parentId]) {
         callInfo[info.parentId].childNs += dur;
@@ -80,10 +116,9 @@ function analyze(events) {
     } else if (ev.type === 'RESUME') {
       const info = callInfo[ev.callId];
       if (!info) continue;
-      // re-enter: reset enterTs for next segment
       info.enterTs = ev.ts;
       info.childNs = 0n;
-      stack.push({ callId: ev.callId, func: ev.func ?? info.func, enterTs: ev.ts });
+      stack.push({ callId: ev.callId, func: ev.func ?? info.func });
     }
   }
 
