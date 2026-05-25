@@ -1696,8 +1696,9 @@ void BytecodeGenerator::GenerateBytecodeBodyWithoutImplicitFinalReturn() {
     BuildGeneratorObjectVariableInitialization();
   }
 
-  // Emit tracing call if requested to do so.
-  if (v8_flags.trace) builder()->CallRuntime(Runtime::kTraceEnter);
+  // Always emit function-enter trace call; the writer is gated on
+  // NODE_TRACE_FILE being set, so there is no overhead when not tracing.
+  builder()->CallRuntime(Runtime::kTraceEnter);
 
   // Increment the function-scope block coverage counter.
   BuildIncrementBlockCoverageCounterIfEnabled(literal, SourceRangeKind::kBody);
@@ -4127,7 +4128,7 @@ void BytecodeGenerator::BuildVariableLoadForAccumulatorValue(
 }
 
 void BytecodeGenerator::BuildReturn(int source_position) {
-  if (v8_flags.trace) {
+  {
     RegisterAllocationScope register_scope(this);
     Register result = register_allocator()->NewRegister();
     // Runtime returns {result} value, preserving accumulator.
@@ -5245,6 +5246,17 @@ void BytecodeGenerator::BuildSuspendPoint(int position) {
   // Save context, registers, and state. This bytecode then returns the value
   // in the accumulator.
   builder()->SetExpressionPosition(position);
+  {
+    // Save the yield value (accumulator) before the trace call — CallRuntime
+    // clobbers the accumulator, but SuspendGenerator reads it as the yielded
+    // value. Restore it before SuspendGenerator runs.  Pass the generator
+    // object so the writer can key the suspended call_id on the generator ptr.
+    RegisterAllocationScope allocation_scope(this);
+    Register acc_save = register_allocator()->NewRegister();
+    builder()->StoreAccumulatorInRegister(acc_save);
+    builder()->CallRuntime(Runtime::kTraceAsyncSuspend, generator_object());
+    builder()->LoadAccumulatorWithRegister(acc_save);
+  }
   builder()->SuspendGenerator(generator_object(), registers, suspend_id);
 
   // Upon resume, we continue here.
@@ -5253,6 +5265,17 @@ void BytecodeGenerator::BuildSuspendPoint(int position) {
   // Clobbers all registers and sets the accumulator to the
   // [[input_or_debug_pos]] slot of the generator object.
   builder()->ResumeGenerator(generator_object(), registers);
+  {
+    // Save the resume value (accumulator) before the trace call — code after
+    // BuildSuspendPoint reads the accumulator as the resolved value of the
+    // await expression, so it must not be clobbered.  Pass the generator
+    // object so the writer can restore the correct call_id from the suspend.
+    RegisterAllocationScope allocation_scope(this);
+    Register acc_save = register_allocator()->NewRegister();
+    builder()->StoreAccumulatorInRegister(acc_save);
+    builder()->CallRuntime(Runtime::kTraceAsyncResume, generator_object());
+    builder()->LoadAccumulatorWithRegister(acc_save);
+  }
 }
 
 void BytecodeGenerator::VisitYield(Yield* expr) {
