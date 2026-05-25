@@ -40,6 +40,9 @@
 //   0x03  ASYNC_RESUME  — resumed.        fields: event, ts, func, call_id
 //   0x04  FUNC_OSR      — JIT handoff (informational; EXIT still fires).
 //                         fields: event, ts, func, call_id
+//   0x05  TURBOFAN_BATCH — N TurboFan-compiled calls since the last Ignition
+//                         event.  fields: event, ts, count(UINT64)
+//                         Emitted just before the next ENTER/EXIT/SUSPEND/RESUME.
 //
 // call_id is a process-global UINT32 counter incremented on every ENTER.
 // SUSPEND/RESUME/EXIT carry the same call_id as their matching ENTER, so
@@ -72,6 +75,7 @@ enum TraceEventType : uint8_t {
   kTraceAsyncSuspend = 0x02,
   kTraceAsyncResume  = 0x03,
   kTraceFuncOSR      = 0x04,  // Ignition handed off to TurboFan mid-execution
+  kTraceTurboFanBatch = 0x05, // N TurboFan calls since the last Ignition event
 };
 
 class TraceWriter {
@@ -145,6 +149,16 @@ class TraceWriter {
       const void* sfi_key, const char* name, int name_len) {
     uint32_t call_id = call_stack_.empty() ? 0 : call_stack_.back();
     EmitFuncEvent(kTraceFuncOSR, sfi_key, name, name_len, call_id);
+  }
+
+  // TURBOFAN_BATCH: drain the per-process TurboFan call counter.
+  // Called from TraceEnter/TraceExit before emitting the Ignition event.
+  void WriteTurboFanBatch(uint64_t count) {
+    EnsureSpace();
+    W1(3);  // 3 fields: evType, ts, count
+    FieldU8((uint8_t)kTraceTurboFanBatch);
+    FieldU64(NowNs());
+    FieldU64(count);
   }
 
   // RESUME: look up the parked call_id and push it back so EXIT can pop it.

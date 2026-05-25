@@ -29,7 +29,15 @@
 #include "src/wasm/wasm-deopt-data.h"
 #endif
 
+#include "src/trace/trace-writer.h"
+
 namespace v8 {
+namespace internal {
+// Defined in runtime-test.cc
+TraceWriter* GetGlobalTraceWriter();
+extern uint64_t g_turbofan_call_count;
+}  // namespace internal
+
 namespace internal {
 namespace compiler {
 
@@ -261,6 +269,14 @@ void CodeGenerator::AssembleCode() {
     masm()->RecordComment("-- Prologue: check for deoptimization --");
     if (v8_flags.debug_code) {
       AssertNotDeoptimized();
+    }
+    // If tracing is active, emit a single incq at every TurboFan function
+    // entry so the Ignition trace events can report how many JIT'd calls
+    // happened in between (TURBOFAN_BATCH events).
+    if (GetGlobalTraceWriter()) {
+      ExternalReference count_ref = ExternalReference::Create(
+          reinterpret_cast<Address>(&g_turbofan_call_count));
+      masm()->incq(masm()->ExternalReferenceAsOperand(count_ref));
     }
   }
 

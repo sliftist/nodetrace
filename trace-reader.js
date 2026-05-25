@@ -15,13 +15,14 @@ const T_STRING   = 0x10;
 const T_FUNCNAME = 0x11;  // string + push to name cache
 const T_FUNCREF  = 0x12;  // 1-byte back-distance into name cache
 
-const EV_ENTER   = 0x00;
-const EV_EXIT    = 0x01;
-const EV_SUSPEND = 0x02;
-const EV_RESUME  = 0x03;
-const EV_OSR     = 0x04;
+const EV_ENTER    = 0x00;
+const EV_EXIT     = 0x01;
+const EV_SUSPEND  = 0x02;
+const EV_RESUME   = 0x03;
+const EV_OSR      = 0x04;
+const EV_TURBOFAN = 0x05;  // N TurboFan calls since the last Ignition event
 
-const EV_NAME = ['ENTER', 'EXIT', 'SUSPEND', 'RESUME', 'OSR'];
+const EV_NAME = ['ENTER', 'EXIT', 'SUSPEND', 'RESUME', 'OSR', 'TURBOFAN'];
 
 // ── Binary reader ──────────────────────────────────────────────────────────────
 
@@ -58,13 +59,16 @@ function readTrace(buf) {
     }
 
     // vals layout:
-    //   ENTER:   [evType, ts, funcName, isAsync, callId]
-    //   others:  [evType, ts, funcName, callId]
-    const [evType, ts, func, ...rest] = vals;
+    //   ENTER:         [evType, ts, funcName, isAsync, callId]
+    //   EXIT/etc:      [evType, ts, funcName, callId]
+    //   TURBOFAN_BATCH:[evType, ts, count]
+    const [evType, ts, ...rest] = vals;
     if (evType === EV_ENTER) {
-      events.push({ type: 'ENTER',                   ts, func, isAsync: !!rest[0], callId: rest[1] });
+      events.push({ type: 'ENTER', ts, func: rest[0], isAsync: !!rest[1], callId: rest[2] });
+    } else if (evType === EV_TURBOFAN) {
+      events.push({ type: 'TURBOFAN', ts, count: rest[0] });
     } else {
-      events.push({ type: EV_NAME[evType] ?? `0x${evType.toString(16)}`, ts, func, callId: rest[0] });
+      events.push({ type: EV_NAME[evType] ?? `0x${evType.toString(16)}`, ts, func: rest[0], callId: rest[1] });
     }
   }
 
@@ -74,10 +78,14 @@ function readTrace(buf) {
 // ── Analysis ───────────────────────────────────────────────────────────────────
 
 function summarize(events) {
-  const counts = {};
-  const wallNs = {};    // total wall time per function name (ENTER→EXIT)
-  const callCount = {}; // how many times each function was entered
-  const stack = [];     // { func, ts, callId }
+  // Use null-prototype objects so names like 'toString' or 'constructor' don't
+  // shadow Object.prototype properties and corrupt the accumulators.
+  const counts    = Object.create(null);
+  const wallNs    = Object.create(null);  // total wall time per function (ENTER→EXIT)
+  const callCount = Object.create(null);  // how many times each function was entered
+  const osrCount  = Object.create(null);  // how many OSR handoffs per function name
+  const stack = [];                       // { func, ts, callId }
+  let turboFanTotal = 0n;  // total TurboFan calls across all batches
 
   for (const ev of events) {
     counts[ev.type] = (counts[ev.type] ?? 0) + 1;
@@ -93,10 +101,14 @@ function summarize(events) {
         const dur = Number(ev.ts - ts);
         wallNs[func] = (wallNs[func] ?? 0) + dur;
       }
+    } else if (ev.type === 'OSR') {
+      osrCount[ev.func] = (osrCount[ev.func] ?? 0) + 1;
+    } else if (ev.type === 'TURBOFAN') {
+      turboFanTotal += ev.count;
     }
   }
 
-  return { counts, wallNs, callCount };
+  return { counts, wallNs, callCount, osrCount, turboFanTotal };
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
@@ -113,21 +125,26 @@ console.log(`Read ${buf.length.toLocaleString()} bytes from ${path}`);
 const events = readTrace(buf);
 console.log(`Decoded ${events.length.toLocaleString()} events\n`);
 
-const { counts, wallNs, callCount } = summarize(events);
+const { counts, wallNs, callCount, osrCount, turboFanTotal } = summarize(events);
 
+const ignitionTotal = counts['ENTER'] ?? 0;
 console.log('Event type breakdown:');
 for (const [type, n] of Object.entries(counts)) {
-  console.log(`  ${type.padEnd(10)} ${n.toLocaleString()}`);
+  console.log(`  ${type.padEnd(12)} ${n.toLocaleString()}`);
 }
+console.log(`\n  Ignition calls (ENTER):   ${ignitionTotal.toLocaleString()}`);
+console.log(`  TurboFan calls (batched): ${turboFanTotal.toLocaleString()}`);
+console.log(`  Total accounted calls:    ${(BigInt(ignitionTotal) + turboFanTotal).toLocaleString()}`);
 
 const top = Object.entries(wallNs)
   .sort((a, b) => b[1] - a[1])
   .slice(0, 25);
 
-console.log('\nTop 25 functions by total wall time:');
-console.log(`  ${'ms'.padStart(12)}  ${'calls'.padStart(8)}  name`);
+console.log('\nTop 25 functions by total wall time (Ignition only):');
+console.log(`  ${'ms'.padStart(12)}  ${'calls'.padStart(8)}  ${'osr'.padStart(5)}  name`);
 for (const [fn, ns] of top) {
   const ms   = (ns / 1e6).toFixed(2).padStart(12);
   const calls = (callCount[fn] ?? 0).toLocaleString().padStart(8);
-  console.log(`  ${ms}  ${calls}  ${fn}`);
+  const osr   = (osrCount[fn] ?? 0).toLocaleString().padStart(5);
+  console.log(`  ${ms}  ${calls}  ${osr}  ${fn}`);
 }

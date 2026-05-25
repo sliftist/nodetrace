@@ -1695,7 +1695,7 @@ void MaybeInitTraceWriter() {
   std::call_once(g_trace_init_flag, []() {
     if (IsMksnapshot()) return;
     const char* path = getenv("NODE_TRACE_FILE");
-    if (!path || path[0] == '\0') path = "node_trace.bin";
+    if (!path || path[0] == '\0') return;  // only trace when explicitly requested
     {
       g_trace_writer = new TraceWriter();
       if (!g_trace_writer->Initialize(path)) {
@@ -1729,9 +1729,24 @@ void PrintIndentation(int stack_size) {
 
 }  // namespace
 
+// Incremented by every TurboFan-compiled JS function call (injected in
+// code-generator.cc).  Lives in v8::internal (not anonymous namespace) so
+// code-generator.cc can take its address via ExternalReference.
+uint64_t g_turbofan_call_count = 0;
+
 // Public accessor so runtime-compiler.cc can emit OSR events without a
 // circular include or a separate translation unit for g_trace_writer.
 TraceWriter* GetGlobalTraceWriter() { return g_trace_writer; }
+
+// Emit a TURBOFAN_BATCH event if any TurboFan calls accumulated since the
+// last Ignition event.  Call this before every Write* on g_trace_writer.
+static inline void DrainTurboFanCount() {
+  if (g_turbofan_call_count > 0 && g_trace_writer) {
+    uint64_t n = g_turbofan_call_count;
+    g_turbofan_call_count = 0;
+    g_trace_writer->WriteTurboFanBatch(n);
+  }
+}
 
 RUNTIME_FUNCTION(Runtime_TraceEnter) {
   SealHandleScope shs(isolate);
@@ -1748,6 +1763,7 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
     int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
     if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
     bool is_async = IsAsyncFunction(sfi->kind());
+    DrainTurboFanCount();
     g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async);
   }
   return ReadOnlyRoots(isolate).undefined_value();
@@ -1768,6 +1784,7 @@ RUNTIME_FUNCTION(Runtime_TraceExit) {
     const char* nm = name.get();
     int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
     if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
+    DrainTurboFanCount();
     g_trace_writer->WriteFuncExit(key, nm, nm_len);
   }
   return obj;  // must return TOS unchanged
@@ -1805,8 +1822,10 @@ RUNTIME_FUNCTION(Runtime_TraceAsyncSuspend) {
   if (g_trace_writer) {
     const void* key; const char* nm; int nm_len;
     std::unique_ptr<char[]> storage;
-    if (GetTopFrameSFI(isolate, &key, &nm, &nm_len, &storage))
+    if (GetTopFrameSFI(isolate, &key, &nm, &nm_len, &storage)) {
+      DrainTurboFanCount();
       g_trace_writer->WriteAsyncSuspend(gen_key, key, nm, nm_len);
+    }
   }
   return ReadOnlyRoots(isolate).undefined_value();
 }
@@ -1822,8 +1841,10 @@ RUNTIME_FUNCTION(Runtime_TraceAsyncResume) {
   if (g_trace_writer) {
     const void* key; const char* nm; int nm_len;
     std::unique_ptr<char[]> storage;
-    if (GetTopFrameSFI(isolate, &key, &nm, &nm_len, &storage))
+    if (GetTopFrameSFI(isolate, &key, &nm, &nm_len, &storage)) {
+      DrainTurboFanCount();
       g_trace_writer->WriteAsyncResume(gen_key, key, nm, nm_len);
+    }
   }
   return ReadOnlyRoots(isolate).undefined_value();
 }
