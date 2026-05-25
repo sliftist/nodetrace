@@ -72,6 +72,25 @@ override the path, or set it to `/dev/null` to suppress tracing entirely.
 
 Decode with `trace-reader.js` (in the repo root).
 
+## Design objective: zero overhead on hot code
+
+The tracing system is designed so that **hot code is never slowed down**.
+
+- All trace hooks live in Ignition (the bytecode interpreter). There is a small
+  overhead per function call, but only while the function runs in Ignition.
+- Once V8 decides a function is hot enough to JIT-compile with TurboFan, it
+  exits Ignition entirely. The TurboFan-compiled machine code has no trace
+  hooks, so those function calls are **not captured in the trace at all** — but
+  they also pay zero tracing overhead.
+- Maglev and Sparkplug (baseline JIT) are disabled so they don't create a
+  middle tier that also lacks hooks.
+
+The practical consequence: if you don't see a function in the trace, it may
+simply have been JIT-compiled. Absence from the trace ≠ not called. Use the
+OSR events (type `OSR` in the reader output) as a signal that TurboFan took
+over for a particular call frame — after an OSR event, the inner calls of that
+frame are no longer visible.
+
 ## Runtime declarations (`deps/v8/src/runtime/runtime.h`)
 
 ```c
