@@ -1388,7 +1388,7 @@ DEFINE_BOOL(
     optimize_maglev_optimizes_to_turbofan, false,
     "make OptimizeMaglevOnNextCall optimize to turbofan instead of maglev")
 
-DEFINE_STRING(turbo_filter, "heavyCompute", "optimization filter for TurboFan compiler")
+DEFINE_STRING(turbo_filter, "*", "optimization filter for TurboFan compiler")
 DEFINE_BOOL(trace_turbo, false, "trace generated TurboFan IR")
 DEFINE_NEG_IMPLICATION(trace_turbo, concurrent_builtin_generation)
 DEFINE_WEAK_IMPLICATION(trace_turbo, concurrent_turbo_tracing)

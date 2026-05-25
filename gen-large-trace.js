@@ -10,7 +10,7 @@
 //   NODE_TRACE_FILE=large_trace.bin ./out/Release/node gen-large-trace.js
 //   node trace-reader.js large_trace.bin
 
-// ── Inner functions (stay in Ignition — not named "heavyCompute") ─────────────
+// ── Inner functions ────────────────────────────────────────────────────────────
 
 function f1(x) { return x * 17 + 3; }
 function f2(x) { return f1(x) ^ (x >>> 1); }
