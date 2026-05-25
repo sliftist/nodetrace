@@ -1687,7 +1687,7 @@ std::once_flag g_trace_init_flag;
 static bool IsMksnapshot() {
   char comm[64] = {};
   int fd = open("/proc/self/comm", O_RDONLY);
-  if (fd >= 0) { read(fd, comm, sizeof(comm) - 1); close(fd); }
+  if (fd >= 0) { (void)read(fd, comm, sizeof(comm) - 1); close(fd); }
   return strncmp(comm, "mksnapshot", 10) == 0;
 }
 
@@ -1735,7 +1735,7 @@ TraceWriter* GetGlobalTraceWriter() { return g_trace_writer; }
 
 RUNTIME_FUNCTION(Runtime_TraceEnter) {
   SealHandleScope shs(isolate);
-  if (args.length() != 0) return CrashUnlessFuzzing(isolate);
+  CHECK_UNLESS_FUZZING(args.length() == 0);
   MaybeInitTraceWriter();
   if (!g_trace_writer) return ReadOnlyRoots(isolate).undefined_value();
   JavaScriptStackFrameIterator it(isolate);
@@ -1755,7 +1755,7 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
 
 RUNTIME_FUNCTION(Runtime_TraceExit) {
   SealHandleScope shs(isolate);
-  if (args.length() != 1) return CrashUnlessFuzzing(isolate);
+  CHECK_UNLESS_FUZZING(args.length() == 1);
   Tagged<Object> obj = args[0];
   MaybeInitTraceWriter();
   if (!g_trace_writer) return obj;
@@ -1795,12 +1795,12 @@ bool GetTopFrameSFI(Isolate* isolate,
 
 RUNTIME_FUNCTION(Runtime_TraceAsyncSuspend) {
   SealHandleScope shs(isolate);
-  if (args.length() != 1) return CrashUnlessFuzzing(isolate);
+  CHECK_UNLESS_FUZZING(args.length() == 1);
   // Use the generator's identity hash as a GC-stable key.
   // GetOrCreateIdentityHash uses DisallowGarbageCollection internally and
   // stores the hash as a Smi in raw_properties_or_hash — no allocation.
   uintptr_t gen_key = static_cast<uintptr_t>(
-      JSReceiver::cast(args[0])->GetOrCreateIdentityHash(isolate).value());
+      Cast<JSReceiver>(args[0])->GetOrCreateIdentityHash(isolate).value());
   MaybeInitTraceWriter();
   if (g_trace_writer) {
     const void* key; const char* nm; int nm_len;
@@ -1813,11 +1813,11 @@ RUNTIME_FUNCTION(Runtime_TraceAsyncSuspend) {
 
 RUNTIME_FUNCTION(Runtime_TraceAsyncResume) {
   SealHandleScope shs(isolate);
-  if (args.length() != 1) return CrashUnlessFuzzing(isolate);
+  CHECK_UNLESS_FUZZING(args.length() == 1);
   // GetOrCreateIdentityHash: hash was already created at SUSPEND time so
   // this path just reads the existing Smi — no allocation, GC-stable.
   uintptr_t gen_key = static_cast<uintptr_t>(
-      JSReceiver::cast(args[0])->GetOrCreateIdentityHash(isolate).value());
+      Cast<JSReceiver>(args[0])->GetOrCreateIdentityHash(isolate).value());
   MaybeInitTraceWriter();
   if (g_trace_writer) {
     const void* key; const char* nm; int nm_len;
