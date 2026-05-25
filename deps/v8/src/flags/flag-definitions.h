@@ -604,7 +604,7 @@ DEFINE_BOOL(force_emit_interrupt_budget_checks, false,
             "force emit tier-up logic from all non-turbofan code, even if it "
             "is the top enabled tier")
 #ifdef V8_ENABLE_MAGLEV
-DEFINE_BOOL(maglev, true, "enable the maglev optimizing compiler")
+DEFINE_BOOL(maglev, false, "enable the maglev optimizing compiler")
 #if !ENABLE_MAGLEV
 // Enable Maglev on Future for platforms in which it's not enabled by default
 // (eg, Android).
@@ -1226,7 +1226,7 @@ DEFINE_IMPLICATION(fuzzing, reuse_scope_infos)
 #else
 #define FLAG FLAG_READONLY
 #endif
-DEFINE_BOOL(sparkplug, ENABLE_SPARKPLUG_BY_DEFAULT,
+DEFINE_BOOL(sparkplug, false,
             "enable Sparkplug baseline compiler")
 DEFINE_BOOL(always_sparkplug, false, "directly tier up to Sparkplug code")
 #if V8_ENABLE_SPARKPLUG
@@ -1388,7 +1388,7 @@ DEFINE_BOOL(
     optimize_maglev_optimizes_to_turbofan, false,
     "make OptimizeMaglevOnNextCall optimize to turbofan instead of maglev")
 
-DEFINE_STRING(turbo_filter, "*", "optimization filter for TurboFan compiler")
+DEFINE_STRING(turbo_filter, "heavyCompute", "optimization filter for TurboFan compiler")
 DEFINE_BOOL(trace_turbo, false, "trace generated TurboFan IR")
 DEFINE_NEG_IMPLICATION(trace_turbo, concurrent_builtin_generation)
 DEFINE_WEAK_IMPLICATION(trace_turbo, concurrent_turbo_tracing)

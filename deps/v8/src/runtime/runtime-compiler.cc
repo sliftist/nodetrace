@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include <optional>
+#include "src/trace/trace-writer.h"
 
 #include "src/asmjs/asm-js.h"
 #include "src/codegen/assembler-inl.h"
@@ -25,6 +26,9 @@
 #endif  // V8_ENABLE_SPARKPLUG_PLUS
 
 namespace v8::internal {
+
+// Defined in runtime-test.cc; gives access to the per-process TraceWriter.
+TraceWriter* GetGlobalTraceWriter();
 
 namespace {
 void LogExecution(Isolate* isolate, DirectHandle<JSFunction> function) {
@@ -720,11 +724,25 @@ RUNTIME_FUNCTION(Runtime_CompileOptimizedOSRFromMaglevInlined) {
 RUNTIME_FUNCTION(Runtime_LogOrTraceOptimizedOSREntry) {
   HandleScope handle_scope(isolate);
   DCHECK_EQ(0, args.length());
-  CHECK(v8_flags.trace_osr || v8_flags.log_function_events);
+  DCHECK(v8_flags.log_or_trace_osr);
 
   BytecodeOffset osr_offset = BytecodeOffset::None();
   Handle<JSFunction> function;
   GetOsrOffsetAndFunctionForOSR(isolate, &osr_offset, &function);
+
+  // Emit FUNC_OSR so the trace reader closes the orphaned ENTER for this call.
+  {
+    TraceWriter* tw = GetGlobalTraceWriter();
+    if (tw) {
+      Tagged<SharedFunctionInfo> sfi = function->shared();
+      const void* key = reinterpret_cast<const void*>(sfi.ptr());
+      std::unique_ptr<char[]> name_buf = sfi->DebugNameCStr();
+      const char* nm = name_buf.get();
+      int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
+      if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
+      tw->WriteOSR(key, nm, nm_len);
+    }
+  }
 
   if (v8_flags.trace_osr) {
     PrintF(CodeTracer::Scope{isolate->GetCodeTracer()}.file(),

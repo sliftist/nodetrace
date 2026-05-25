@@ -679,6 +679,8 @@ constexpr bool CanTriggerGC(T... properties) {
   F(TakeHeapSnapshot, -1, 1)                                             \
   F(TraceEnter, 0, 1)                                                    \
   F(TraceExit, 1, 1)                                                     \
+  F(TraceAsyncSuspend, 1, 1)                                             \
+  F(TraceAsyncResume, 1, 1)                                              \
   F(TurbofanStaticAssert, 1, 1)                                          \
   F(TypedArraySpeciesProtector, 0, 1)                                    \
   F(WaitForBackgroundOptimization, 0, 1)                                 \
