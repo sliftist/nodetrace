@@ -66,7 +66,8 @@ function readTrace(buf) {
     if (evType === EV_ENTER) {
       events.push({ type: 'ENTER', ts, func: rest[0], isAsync: !!rest[1], callId: rest[2] });
     } else if (evType === EV_TURBOFAN) {
-      events.push({ type: 'TURBOFAN', ts, count: rest[0] });
+      // rest = [tsEnd, count]  (ts = ts_start of the window)
+      events.push({ type: 'TURBOFAN', ts, tsEnd: rest[0], count: rest[1] });
     } else {
       events.push({ type: EV_NAME[evType] ?? `0x${evType.toString(16)}`, ts, func: rest[0], callId: rest[1] });
     }

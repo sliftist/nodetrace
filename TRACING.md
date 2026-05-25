@@ -139,7 +139,7 @@ summary for readers.
 | 0x02  | ASYNC_SUSPEND  | evType, ts(u64), func, call_id(u32)        |
 | 0x03  | ASYNC_RESUME   | evType, ts(u64), func, call_id(u32)        |
 | 0x04  | FUNC_OSR       | evType, ts(u64), func, call_id(u32)        |
-| 0x05  | TURBOFAN_BATCH | evType, ts(u64), count(u64)                |
+| 0x05  | TURBOFAN_BATCH | evType, ts_start(u64), ts_end(u64), count(u64) |
 
 `call_id` is a process-global uint32 counter incremented on every ENTER.
 SUSPEND/RESUME/EXIT carry the same `call_id` as their matching ENTER.

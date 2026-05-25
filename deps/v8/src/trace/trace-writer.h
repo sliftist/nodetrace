@@ -41,8 +41,10 @@
 //   0x04  FUNC_OSR      — JIT handoff (informational; EXIT still fires).
 //                         fields: event, ts, func, call_id
 //   0x05  TURBOFAN_BATCH — N TurboFan-compiled calls since the last Ignition
-//                         event.  fields: event, ts, count(UINT64)
-//                         Emitted just before the next ENTER/EXIT/SUSPEND/RESUME.
+//                         event.  fields: event, ts_start(UINT64), ts_end(UINT64),
+//                         count(UINT64).  ts_start = timestamp of the last
+//                         Ignition event; ts_end = now.  Emitted just before
+//                         the next ENTER/EXIT/SUSPEND/RESUME.
 //
 // call_id is a process-global UINT32 counter incremented on every ENTER.
 // SUSPEND/RESUME/EXIT carry the same call_id as their matching ENTER, so
@@ -82,7 +84,8 @@ class TraceWriter {
  public:
   TraceWriter()
       : buf_(nullptr), ptr_(nullptr), buf_end_(nullptr), fd_(-1),
-        next_call_id_(0), cache_head_(0), cache_count_(0) {
+        next_call_id_(0), cache_head_(0), cache_count_(0),
+        last_event_ts_(0) {
     memset(cache_, 0, sizeof(cache_));
   }
 
@@ -120,6 +123,7 @@ class TraceWriter {
     else          { CacheInsert(sfi_key); FieldFuncName(name, name_len); }
     FieldU8(is_async ? 1 : 0);
     FieldU32(call_id);
+    last_event_ts_ = ts;
   }
 
   __attribute__((always_inline)) inline void WriteFuncExit(
@@ -152,13 +156,16 @@ class TraceWriter {
   }
 
   // TURBOFAN_BATCH: drain the per-process TurboFan call counter.
-  // Called from TraceEnter/TraceExit before emitting the Ignition event.
+  // Emits a time window [last_event_ts_, now] covering the JIT'd calls.
   void WriteTurboFanBatch(uint64_t count) {
     EnsureSpace();
-    W1(3);  // 3 fields: evType, ts, count
+    uint64_t ts_end = NowNs();
+    W1(4);  // 4 fields: evType, ts_start, ts_end, count
     FieldU8((uint8_t)kTraceTurboFanBatch);
-    FieldU64(NowNs());
+    FieldU64(last_event_ts_);
+    FieldU64(ts_end);
     FieldU64(count);
+    last_event_ts_ = ts_end;
   }
 
   // RESUME: look up the parked call_id and push it back so EXIT can pop it.
@@ -250,6 +257,9 @@ class TraceWriter {
     return (uint64_t)ts.tv_sec * 1'000'000'000ULL + (uint64_t)ts.tv_nsec;
   }
 
+  // ── Timestamp of last emitted Ignition/TurboFan event ───────────────────────
+  uint64_t last_event_ts_;
+
   // ── Call ID counter + call stack ─────────────────────────────────────────────
   // call_stack_: each ENTER pushes, EXIT pops.  SUSPEND pops too (child async
   // frames must not shadow the parent's id) and parks the id in
@@ -292,6 +302,7 @@ class TraceWriter {
     if (dist > 0) { FieldFuncRef((uint8_t)dist); }
     else          { CacheInsert(sfi_key); FieldFuncName(name, name_len); }
     FieldU32(call_id);
+    last_event_ts_ = ts;
   }
 };
 
