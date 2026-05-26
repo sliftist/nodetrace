@@ -1,0 +1,19 @@
+Max call stack depth: 16
+
+Stack at max depth (bottom → top):
+  [0] callId=0  (anonymous)
+  [1] callId=889  evalTypeScript
+  [2] callId=890  get
+  [3] callId=891  (anonymous)
+  [4] callId=894  wrapModuleLoad
+  [5] callId=895  (anonymous)
+  [6] callId=896  (anonymous)
+  [7] callId=897  tracingChannel
+  [8] callId=898  TracingChannel
+  [9] callId=900  BoundedChannel
+  [10] callId=901  channelFromMap
+  [11] callId=902  channel
+  [12] callId=904  Channel
+  [13] callId=905  set
+  [14] callId=906  WeakReference
+  [15] callId=907  WeakReference

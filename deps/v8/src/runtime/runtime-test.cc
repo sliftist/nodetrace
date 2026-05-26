@@ -1703,7 +1703,7 @@ void MaybeInitTraceWriter() {
         g_trace_writer = nullptr;
         fprintf(stderr, "TraceWriter: failed to open '%s'\n", path);
       } else {
-        atexit([]() { if (g_trace_writer) g_trace_writer->Flush(); });
+        atexit([]() { if (g_trace_writer) { delete g_trace_writer; g_trace_writer = nullptr; } });
         // Enable the x64/arm64/... OSR-entry builtin to call
         // Runtime_LogOrTraceOptimizedOSREntry so we can emit FUNC_OSR events.
         v8_flags.log_or_trace_osr = true;
@@ -1755,19 +1755,20 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
   if (!g_trace_writer) return ReadOnlyRoots(isolate).undefined_value();
   JavaScriptStackFrameIterator it(isolate);
   if (!it.done()) {
+    uintptr_t fp = it.frame()->fp();
     Tagged<JSFunction> func = it.frame()->function();
     Tagged<SharedFunctionInfo> sfi = func->shared();
     const void* key = reinterpret_cast<const void*>(sfi.ptr());
     bool is_async = IsAsyncFunction(sfi->kind());
     DrainOptimizedCount();
     if (g_trace_writer->HasName(key)) {
-      g_trace_writer->WriteFuncEnter(key, nullptr, 0, is_async);
+      g_trace_writer->WriteFuncEnter(key, nullptr, 0, is_async, fp);
     } else {
       std::unique_ptr<char[]> name = sfi->DebugNameCStr();
       const char* nm = name.get();
       int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
       if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
-      g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async);
+      g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async, fp);
     }
   }
   return ReadOnlyRoots(isolate).undefined_value();
@@ -1781,32 +1782,35 @@ RUNTIME_FUNCTION(Runtime_TraceExit) {
   if (!g_trace_writer) return obj;
   JavaScriptStackFrameIterator it(isolate);
   if (!it.done()) {
+    uintptr_t fp = it.frame()->fp();
     Tagged<JSFunction> func = it.frame()->function();
     Tagged<SharedFunctionInfo> sfi = func->shared();
     const void* key = reinterpret_cast<const void*>(sfi.ptr());
     DrainOptimizedCount();
     if (g_trace_writer->HasName(key)) {
-      g_trace_writer->WriteFuncExit(key, nullptr, 0);
+      g_trace_writer->WriteFuncExit(fp, key, nullptr, 0);
     } else {
       std::unique_ptr<char[]> name = sfi->DebugNameCStr();
       const char* nm = name.get();
       int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
       if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
-      g_trace_writer->WriteFuncExit(key, nm, nm_len);
+      g_trace_writer->WriteFuncExit(fp, key, nm, nm_len);
     }
   }
   return obj;  // must return TOS unchanged
 }
 
-// Shared helper: get SFI key and (if needed) name from the top JS frame.
+// Shared helper: get SFI key, frame pointer, and (if needed) name from the top JS frame.
 namespace {
 bool GetTopFrameSFI(Isolate* isolate,
                     const void** key_out,
+                    uintptr_t* fp_out,
                     const char** nm_out,
                     int* nm_len_out,
                     std::unique_ptr<char[]>* storage) {
   JavaScriptStackFrameIterator it(isolate);
   if (it.done()) return false;
+  *fp_out = it.frame()->fp();
   Tagged<JSFunction> func = it.frame()->function();
   Tagged<SharedFunctionInfo> sfi = func->shared();
   *key_out = reinterpret_cast<const void*>(sfi.ptr());
@@ -1825,18 +1829,13 @@ bool GetTopFrameSFI(Isolate* isolate,
 RUNTIME_FUNCTION(Runtime_TraceAsyncSuspend) {
   SealHandleScope shs(isolate);
   CHECK_UNLESS_FUZZING(args.length() == 1);
-  // Use the generator's identity hash as a GC-stable key.
-  // GetOrCreateIdentityHash uses DisallowGarbageCollection internally and
-  // stores the hash as a Smi in raw_properties_or_hash — no allocation.
-  uintptr_t gen_key = static_cast<uintptr_t>(
-      Cast<JSReceiver>(args[0])->GetOrCreateIdentityHash(isolate).value());
   MaybeInitTraceWriter();
   if (g_trace_writer) {
-    const void* key; const char* nm; int nm_len;
+    const void* key; uintptr_t fp; const char* nm; int nm_len;
     std::unique_ptr<char[]> storage;
-    if (GetTopFrameSFI(isolate, &key, &nm, &nm_len, &storage)) {
+    if (GetTopFrameSFI(isolate, &key, &fp, &nm, &nm_len, &storage)) {
       DrainOptimizedCount();
-      g_trace_writer->WriteAsyncSuspend(gen_key, key, nm, nm_len);
+      g_trace_writer->WriteAsyncSuspend(fp, key, nm, nm_len);
     }
   }
   return ReadOnlyRoots(isolate).undefined_value();
@@ -1845,17 +1844,13 @@ RUNTIME_FUNCTION(Runtime_TraceAsyncSuspend) {
 RUNTIME_FUNCTION(Runtime_TraceAsyncResume) {
   SealHandleScope shs(isolate);
   CHECK_UNLESS_FUZZING(args.length() == 1);
-  // GetOrCreateIdentityHash: hash was already created at SUSPEND time so
-  // this path just reads the existing Smi — no allocation, GC-stable.
-  uintptr_t gen_key = static_cast<uintptr_t>(
-      Cast<JSReceiver>(args[0])->GetOrCreateIdentityHash(isolate).value());
   MaybeInitTraceWriter();
   if (g_trace_writer) {
-    const void* key; const char* nm; int nm_len;
+    const void* key; uintptr_t fp; const char* nm; int nm_len;
     std::unique_ptr<char[]> storage;
-    if (GetTopFrameSFI(isolate, &key, &nm, &nm_len, &storage)) {
+    if (GetTopFrameSFI(isolate, &key, &fp, &nm, &nm_len, &storage)) {
       DrainOptimizedCount();
-      g_trace_writer->WriteAsyncResume(gen_key, key, nm, nm_len);
+      g_trace_writer->WriteAsyncResume(fp, key, nm, nm_len);
     }
   }
   return ReadOnlyRoots(isolate).undefined_value();

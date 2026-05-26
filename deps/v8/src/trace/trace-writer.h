@@ -4,8 +4,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
-#include <unordered_map>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
@@ -39,8 +39,12 @@
 // name_idx is assigned in order of first appearance (0, 1, 2, ...).
 // The reader maintains a flat array: names[name_idx] = string.
 //
-// call_id is a process-global u32 counter incremented on every ENTER.
-// SUSPEND/RESUME/EXIT carry the same call_id as their matching ENTER.
+// Async semantics — each synchronous slice is its own call:
+//   ENTER  (is_async=1) → start of first slice; call_id = fresh id
+//   SUSPEND             → end of that slice;  call_id matches its ENTER
+//   RESUME              → start of next slice; call_id = fresh id (not the ENTER's)
+//   EXIT                → end of the last slice (after RESUME or directly after ENTER)
+// call_id is a process-global u32 counter incremented on every ENTER and RESUME.
 //
 // Approximate record sizes (delta fits in 1 byte — typical between events):
 //   NEW_NAME (len N):                  1 + 1 + 4 + 2 + N = 8+N bytes
@@ -139,6 +143,7 @@ class TraceWriter {
         next_call_id_(0), last_event_ts_(0) {}
 
   ~TraceWriter() {
+    CloseRemainingFrames();
     Flush();
     if (fd_ >= 0) { close(fd_); fd_ = -1; }
     if (buf_)     { free(buf_); buf_ = nullptr; }
@@ -162,12 +167,13 @@ class TraceWriter {
   }
 
   __attribute__((always_inline)) inline void WriteFuncEnter(
-      const void* sfi_key, const char* name, int name_len, bool is_async) {
+      const void* sfi_key, const char* name, int name_len, bool is_async,
+      uintptr_t frame_ptr) {
     EnsureSpace();
     uint32_t call_id = next_call_id_++;
-    call_stack_.push_back(call_id);
     uint64_t ts = NowNs();
     uint32_t idx = EnsureNamed(sfi_key, name, name_len, ts);
+    call_stack_.push_back({call_id, sfi_key, idx, frame_ptr});
     WriteHeader(kTraceFuncEnter, ts);
     W4(idx);
     W1(is_async ? 1 : 0);
@@ -175,23 +181,46 @@ class TraceWriter {
   }
 
   __attribute__((always_inline)) inline void WriteFuncExit(
-      const void* sfi_key, const char* name, int name_len) {
-    uint32_t call_id = call_stack_.empty() ? 0 : call_stack_.back();
-    if (!call_stack_.empty()) call_stack_.pop_back();
-    EmitFuncEvent(kTraceFuncExit, sfi_key, name, name_len, call_id);
+      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
+    if (!call_stack_.empty() && call_stack_.back().frame_ptr == frame_ptr) {
+      uint32_t call_id = call_stack_.back().call_id;
+      call_stack_.pop_back();
+      EmitFuncEvent(kTraceFuncExit, sfi_key, name, name_len, call_id);
+      return;
+    }
+    HandleMismatchedExit(frame_ptr, sfi_key, name, name_len);
   }
 
   __attribute__((noinline)) void WriteAsyncSuspend(
-      uintptr_t gen_key, const void* sfi_key, const char* name, int name_len) {
-    uint32_t call_id = call_stack_.empty() ? 0 : call_stack_.back();
-    if (!call_stack_.empty()) call_stack_.pop_back();
-    suspended_calls_[gen_key] = call_id;
-    EmitFuncEvent(kTraceAsyncSuspend, sfi_key, name, name_len, call_id);
+      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
+    if (!call_stack_.empty() && call_stack_.back().frame_ptr == frame_ptr) {
+      uint32_t call_id = call_stack_.back().call_id;
+      call_stack_.pop_back();
+      EmitFuncEvent(kTraceAsyncSuspend, sfi_key, name, name_len, call_id);
+      return;
+    }
+    HandleMismatchedSuspend(frame_ptr, sfi_key, name, name_len);
   }
 
   __attribute__((noinline)) void WriteOnStackReplacement(
       const void* sfi_key, const char* name, int name_len) {
-    uint32_t call_id = call_stack_.empty() ? 0 : call_stack_.back();
+    // TurboFan takes over this frame — pop it, Ignition will never EXIT it.
+    if (!call_stack_.empty() && call_stack_.back().sfi_key == sfi_key) {
+      uint32_t call_id = call_stack_.back().call_id;
+      call_stack_.pop_back();
+      EmitFuncEvent(kTraceFuncOnStackReplacement, sfi_key, name, name_len, call_id);
+      return;
+    }
+    int idx = FindInStackBySfi(sfi_key);
+    if (idx < 0) return;  // JIT-compiled entry — no Ignition ENTER to close
+    if (StrictMode()) {
+      fprintf(stderr, "NODE_TRACE_STRICT: ON_STACK_REPLACEMENT for '%s' not at top "
+              "(%d frame(s) above it)\n", name, (int)call_stack_.size() - 1 - idx);
+      _exit(1);
+    }
+    ForceCloseAbove(idx);
+    uint32_t call_id = call_stack_.back().call_id;
+    call_stack_.pop_back();
     EmitFuncEvent(kTraceFuncOnStackReplacement, sfi_key, name, name_len, call_id);
   }
 
@@ -203,15 +232,15 @@ class TraceWriter {
   }
 
   __attribute__((noinline)) void WriteAsyncResume(
-      uintptr_t gen_key, const void* sfi_key, const char* name, int name_len) {
-    auto it = suspended_calls_.find(gen_key);
-    uint32_t call_id = 0;
-    if (it != suspended_calls_.end()) {
-      call_id = it->second;
-      call_stack_.push_back(call_id);
-      suspended_calls_.erase(it);
-    }
-    EmitFuncEvent(kTraceAsyncResume, sfi_key, name, name_len, call_id);
+      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
+    EnsureSpace();
+    uint32_t call_id = next_call_id_++;
+    uint64_t ts = NowNs();
+    uint32_t idx = EnsureNamed(sfi_key, name, name_len, ts);
+    call_stack_.push_back({call_id, sfi_key, idx, frame_ptr});
+    WriteHeader(kTraceAsyncResume, ts);
+    W4(idx);
+    W4(call_id);
   }
 
   void Flush() { FlushBuffer(); }
@@ -303,6 +332,11 @@ class TraceWriter {
       W4(idx);
       W2((uint16_t)name_len);
       WBytes(name, name_len);
+      if (StrictMode()) {
+        if (idx >= debug_name_strs_.size()) debug_name_strs_.resize(idx + 1);
+        debug_name_strs_[idx] = (name && name_len > 0)
+            ? std::string(name, name_len) : "(anonymous)";
+      }
     }
     return idx;
   }
@@ -311,12 +345,18 @@ class TraceWriter {
   uint64_t last_event_ts_;
 
   // ── Call ID + call stack ─────────────────────────────────────────────────────
-  uint32_t              next_call_id_;
-  std::vector<uint32_t> call_stack_;
-  std::unordered_map<uintptr_t, uint32_t> suspended_calls_;
+  struct StackFrame { uint32_t call_id; const void* sfi_key; uint32_t name_idx; uintptr_t frame_ptr; };
+  uint32_t                next_call_id_;
+  std::vector<StackFrame> call_stack_;
+  std::vector<std::string> debug_name_strs_;  // idx→name, only in strict mode
 
   // ── SFI pointer → name index table ──────────────────────────────────────────
   SfiNameTable name_table_;
+
+  // ── Close all open frames on shutdown ───────────────────────────────────────
+  __attribute__((noinline)) void CloseRemainingFrames() {
+    ForceCloseAbove(-1);
+  }
 
   // ── Core emitter for EXIT / SUSPEND / RESUME / ON_STACK_REPLACEMENT ─────────
   __attribute__((always_inline)) inline void EmitFuncEvent(
@@ -328,6 +368,105 @@ class TraceWriter {
     WriteHeader(type, ts);
     W4(idx);
     W4(call_id);
+  }
+
+  // ── Stack helpers ────────────────────────────────────────────────────────────
+  // Returns the index of frame_ptr in call_stack_ (searching from top), or -1.
+  int FindInStack(uintptr_t frame_ptr) const {
+    for (int i = (int)call_stack_.size() - 1; i >= 0; i--) {
+      if (call_stack_[i].frame_ptr == frame_ptr) return i;
+    }
+    return -1;
+  }
+
+  // Returns the index of sfi_key in call_stack_ (searching from top), or -1.
+  // Used only for OSR matching where frame_ptr is from TurboFan, not Ignition.
+  int FindInStackBySfi(const void* sfi_key) const {
+    for (int i = (int)call_stack_.size() - 1; i >= 0; i--) {
+      if (call_stack_[i].sfi_key == sfi_key) return i;
+    }
+    return -1;
+  }
+
+  // Emits EXIT for every frame above target_idx, popping as it goes.
+  // Pass target_idx=-1 to close everything.
+  __attribute__((noinline)) void ForceCloseAbove(int target_idx) {
+    while ((int)call_stack_.size() - 1 > target_idx) {
+      const StackFrame f = call_stack_.back();
+      call_stack_.pop_back();
+      EmitFuncEvent(kTraceFuncExit, f.sfi_key, nullptr, 0, f.call_id);
+    }
+  }
+
+  static bool StrictMode() {
+    static bool checked = false, strict = false;
+    if (__builtin_expect(!checked, 0)) {
+      strict = getenv("NODE_TRACE_STRICT") != nullptr;
+      checked = true;
+    }
+    return strict;
+  }
+
+  // Called when EXIT arrives for a frame_ptr that isn't at the top of the stack.
+  // Not-found (idx<0) means the start was JIT'd — silently ignored, not an error.
+  // Found-but-not-top means we missed intervening exits — close them first.
+  __attribute__((noinline)) void HandleMismatchedExit(
+      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
+    int idx = FindInStack(frame_ptr);
+    if (idx < 0) return;  // start was JIT'd, no matching ENTER — ignore
+    if (StrictMode()) {
+      int n_above = (int)call_stack_.size() - 1 - idx;
+      const char* fn = (name && name_len > 0) ? name
+          : (call_stack_[idx].name_idx < debug_name_strs_.size()
+              ? debug_name_strs_[call_stack_[idx].name_idx].c_str() : "?");
+      fprintf(stderr, "NODE_TRACE_STRICT: EXIT for '%s' (callId=%u) not at top — "
+              "%d frame(s) above it\n", fn, call_stack_[idx].call_id, n_above);
+      // Print up to 15 ancestor frames (callers of the mismatched function)
+      int anc_start = idx - 1;
+      int anc_show  = 15;
+      if (idx - anc_show > 0) {
+        fprintf(stderr, "  ... (%d more frames below) ...\n", idx - anc_show);
+        anc_start = anc_show - 1;
+      }
+      for (int i = (idx <= anc_show ? idx - 1 : anc_show - 1); i >= 0; i--) {
+        int actual = (idx <= anc_show) ? i : (idx - anc_show + i);
+        const char* frame_name = call_stack_[actual].name_idx < debug_name_strs_.size()
+            ? debug_name_strs_[call_stack_[actual].name_idx].c_str() : "?";
+        fprintf(stderr, "  [caller %d] callId=%u  %s\n",
+                idx - actual, call_stack_[actual].call_id, frame_name);
+      }
+      fprintf(stderr, "  >>> callId=%u  %s  (EXIT mismatch here)\n",
+              call_stack_[idx].call_id, fn);
+      // Print all frames above (children still on stack)
+      for (int i = idx + 1; i < (int)call_stack_.size(); i++) {
+        const char* frame_name = call_stack_[i].name_idx < debug_name_strs_.size()
+            ? debug_name_strs_[call_stack_[i].name_idx].c_str() : "?";
+        fprintf(stderr, "  [+%d] callId=%u  %s\n",
+                i - idx, call_stack_[i].call_id, frame_name);
+      }
+      FlushBuffer();
+      _exit(1);
+    }
+    ForceCloseAbove(idx);
+    uint32_t call_id = call_stack_.back().call_id;
+    call_stack_.pop_back();
+    EmitFuncEvent(kTraceFuncExit, sfi_key, name, name_len, call_id);
+  }
+
+  __attribute__((noinline)) void HandleMismatchedSuspend(
+      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
+    int idx = FindInStack(frame_ptr);
+    if (idx < 0) return;
+    if (StrictMode()) {
+      fprintf(stderr, "NODE_TRACE_STRICT: SUSPEND for '%s' not at top of stack "
+              "(%d frame(s) above it)\n", name,
+              (int)call_stack_.size() - 1 - idx);
+      _exit(1);
+    }
+    ForceCloseAbove(idx);
+    uint32_t call_id = call_stack_.back().call_id;
+    call_stack_.pop_back();
+    EmitFuncEvent(kTraceAsyncSuspend, sfi_key, name, name_len, call_id);
   }
 };
 
