@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
@@ -35,6 +37,10 @@
 //            Assigns a permanent index to a function name.  Always emitted
 //            before the first call event that references that name_idx.
 //            The following call event has delta=0 (same timestamp).
+//   0x07  EXCLUDED_BATCH  count(u32-LE)
+//            count calls (ENTER+EXIT counted as 1) that were dropped by the
+//            INSPECT_MAX_PER_SECOND throttle.  Emitted immediately before the
+//            next kept event; ts = that next event's timestamp.
 //
 // name_idx is assigned in order of first appearance (0, 1, 2, ...).
 // The reader maintains a flat array: names[name_idx] = string.
@@ -46,11 +52,19 @@
 //   EXIT                → end of the last slice (after RESUME or directly after ENTER)
 // call_id is a process-global u32 counter incremented on every ENTER and RESUME.
 //
+// Throttling (INSPECT_MAX_PER_SECOND, default 100 000):
+//   Events are staged for up to 100 ms, then filtered.  Calls shorter than a
+//   computed duration threshold are dropped and counted into EXCLUDED_BATCH.
+//   The threshold is derived by exponential-bucket histogram so that the
+//   surviving call count ≈ max_per_second × 0.1 per 100 ms window.
+//   A synthetic FUNC_ENTER / FUNC_EXIT pair named "(trace-flush)" wraps each
+//   flush period, showing exactly how long the filter pass took.
+//
 // Approximate record sizes (delta fits in 1 byte — typical between events):
 //   NEW_NAME (len N):                  1 + 1 + 4 + 2 + N = 8+N bytes
 //   ENTER:                             1 + 1 + 4 + 1 + 4 = 11 bytes
 //   EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT: 1 + 1 + 4 + 4 = 10 bytes
-//   OPTIMIZED_BATCH:                   1 + 1 + 4 = 6 bytes
+//   OPTIMIZED_BATCH / EXCLUDED_BATCH:  1 + 1 + 4 = 6 bytes
 
 namespace v8 {
 namespace internal {
@@ -66,6 +80,7 @@ enum TraceEventType : uint8_t {
   kTraceFuncOnStackReplacement = 0x04,
   kTraceOptimizedBatch         = 0x05,
   kTraceNewName                = 0x06,
+  kTraceExcludedBatch          = 0x07,
 };
 
 // ── SFI pointer → name index hash table ──────────────────────────────────────
@@ -140,11 +155,12 @@ class TraceWriter {
  public:
   TraceWriter()
       : buf_(nullptr), ptr_(nullptr), buf_end_(nullptr), fd_(-1),
-        next_call_id_(0), last_event_ts_(0) {}
+        next_call_id_(0), last_event_ts_(0), max_per_second_(100000) {}
 
   ~TraceWriter() {
-    CloseRemainingFrames();
-    Flush();
+    ForceCloseAbove(-1);  // push any remaining open frames to stage_
+    FlushStageAll();       // emit all staged events to binary buffer without filtering
+    FlushBuffer();
     if (fd_ >= 0) { close(fd_); fd_ = -1; }
     if (buf_)     { free(buf_); buf_ = nullptr; }
   }
@@ -157,35 +173,48 @@ class TraceWriter {
     buf_     = static_cast<uint8_t*>(mem);
     ptr_     = buf_;
     buf_end_ = buf_ + kTraceChunkSize;
+
+    const char* mps = getenv("INSPECT_MAX_PER_SECOND");
+    if (mps) {
+      uint64_t v = strtoull(mps, nullptr, 10);
+      if (v > 0 && v <= UINT32_MAX) max_per_second_ = static_cast<uint32_t>(v);
+    }
     return true;
   }
 
   // Returns true if this SFI pointer has already been assigned a name index.
-  // The caller can use this to skip the expensive DebugNameCStr() call.
   __attribute__((always_inline)) inline bool HasName(const void* sfi_key) const {
     return name_table_.Has(sfi_key);
   }
 
+  // Public timing helper so the flush-timer callback can bracket the flush.
+  __attribute__((always_inline)) inline uint64_t NowNs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1'000'000'000ULL + (uint64_t)ts.tv_nsec;
+  }
+
+  // ── Trace event writers — push to stage_, call_stack_ tracked in real-time ──
+
   __attribute__((always_inline)) inline void WriteFuncEnter(
       const void* sfi_key, const char* name, int name_len, bool is_async,
       uintptr_t frame_ptr) {
-    EnsureSpace();
     uint32_t call_id = next_call_id_++;
     uint64_t ts = NowNs();
     uint32_t idx = EnsureNamed(sfi_key, name, name_len, ts);
     call_stack_.push_back({call_id, sfi_key, idx, frame_ptr});
-    WriteHeader(kTraceFuncEnter, ts);
-    W4(idx);
-    W1(is_async ? 1 : 0);
-    W4(call_id);
+    stage_.push_back({.type = kTraceFuncEnter, .ts = ts,
+                      .name_idx = idx, .call_id = call_id, .is_async = is_async});
   }
 
   __attribute__((always_inline)) inline void WriteFuncExit(
       uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
     if (!call_stack_.empty() && call_stack_.back().frame_ptr == frame_ptr) {
-      uint32_t call_id = call_stack_.back().call_id;
+      uint32_t call_id  = call_stack_.back().call_id;
+      uint32_t name_idx = call_stack_.back().name_idx;
       call_stack_.pop_back();
-      EmitFuncEvent(kTraceFuncExit, sfi_key, name, name_len, call_id);
+      stage_.push_back({.type = kTraceFuncExit, .ts = NowNs(),
+                        .name_idx = name_idx, .call_id = call_id});
       return;
     }
     HandleMismatchedExit(frame_ptr, sfi_key, name, name_len);
@@ -194,21 +223,35 @@ class TraceWriter {
   __attribute__((noinline)) void WriteAsyncSuspend(
       uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
     if (!call_stack_.empty() && call_stack_.back().frame_ptr == frame_ptr) {
-      uint32_t call_id = call_stack_.back().call_id;
+      uint32_t call_id  = call_stack_.back().call_id;
+      uint32_t name_idx = call_stack_.back().name_idx;
       call_stack_.pop_back();
-      EmitFuncEvent(kTraceAsyncSuspend, sfi_key, name, name_len, call_id);
+      stage_.push_back({.type = kTraceAsyncSuspend, .ts = NowNs(),
+                        .name_idx = name_idx, .call_id = call_id});
       return;
     }
     HandleMismatchedSuspend(frame_ptr, sfi_key, name, name_len);
+  }
+
+  __attribute__((noinline)) void WriteAsyncResume(
+      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
+    uint32_t call_id = next_call_id_++;
+    uint64_t ts = NowNs();
+    uint32_t idx = EnsureNamed(sfi_key, name, name_len, ts);
+    call_stack_.push_back({call_id, sfi_key, idx, frame_ptr});
+    stage_.push_back({.type = kTraceAsyncResume, .ts = ts,
+                      .name_idx = idx, .call_id = call_id});
   }
 
   __attribute__((noinline)) void WriteOnStackReplacement(
       const void* sfi_key, const char* name, int name_len) {
     // TurboFan takes over this frame — pop it, Ignition will never EXIT it.
     if (!call_stack_.empty() && call_stack_.back().sfi_key == sfi_key) {
-      uint32_t call_id = call_stack_.back().call_id;
+      uint32_t call_id  = call_stack_.back().call_id;
+      uint32_t name_idx = call_stack_.back().name_idx;
       call_stack_.pop_back();
-      EmitFuncEvent(kTraceFuncOnStackReplacement, sfi_key, name, name_len, call_id);
+      stage_.push_back({.type = kTraceFuncOnStackReplacement, .ts = NowNs(),
+                        .name_idx = name_idx, .call_id = call_id});
       return;
     }
     int idx = FindInStackBySfi(sfi_key);
@@ -219,29 +262,19 @@ class TraceWriter {
       _exit(1);
     }
     ForceCloseAbove(idx);
-    uint32_t call_id = call_stack_.back().call_id;
+    uint32_t call_id  = call_stack_.back().call_id;
+    uint32_t name_idx = call_stack_.back().name_idx;
     call_stack_.pop_back();
-    EmitFuncEvent(kTraceFuncOnStackReplacement, sfi_key, name, name_len, call_id);
+    stage_.push_back({.type = kTraceFuncOnStackReplacement, .ts = NowNs(),
+                      .name_idx = name_idx, .call_id = call_id});
   }
 
   void WriteOptimizedBatch(uint64_t count) {
-    EnsureSpace();
-    uint64_t ts_end = NowNs();
-    WriteHeader(kTraceOptimizedBatch, ts_end);
-    W4((uint32_t)count);
+    stage_.push_back({.type = kTraceOptimizedBatch, .ts = NowNs(),
+                      .batch_count = static_cast<uint32_t>(count)});
   }
 
-  __attribute__((noinline)) void WriteAsyncResume(
-      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
-    EnsureSpace();
-    uint32_t call_id = next_call_id_++;
-    uint64_t ts = NowNs();
-    uint32_t idx = EnsureNamed(sfi_key, name, name_len, ts);
-    call_stack_.push_back({call_id, sfi_key, idx, frame_ptr});
-    WriteHeader(kTraceAsyncResume, ts);
-    W4(idx);
-    W4(call_id);
-  }
+  // ── Buffer I/O ──────────────────────────────────────────────────────────────
 
   void Flush() { FlushBuffer(); }
 
@@ -259,7 +292,159 @@ class TraceWriter {
     ptr_ = buf_;
   }
 
+  // ── Stage flush — called by the 100ms libuv timer ──────────────────────────
+
+  // Filter staged events to meet INSPECT_MAX_PER_SECOND, then emit to buf_.
+  __attribute__((noinline)) void FlushStage() {
+    if (stage_.empty()) return;
+
+    // Count call starts (ENTER + RESUME) in this window.
+    uint32_t start_count = 0;
+    for (const auto& e : stage_) {
+      if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) start_count++;
+    }
+
+    // target = calls allowed in a 100ms window
+    uint32_t target = static_cast<uint32_t>(
+        static_cast<uint64_t>(max_per_second_) * 100 / 1000);
+
+    if (start_count <= target) {
+      FlushStageAll();
+      return;
+    }
+
+    // ── Pass 1: build exponential duration histogram ─────────────────────────
+    // Bucket b covers durations in [2^b, 2^(b+1)) ns; bucket 0 covers [0, 2).
+    std::unordered_map<uint32_t, uint64_t> open_ts;
+    open_ts.reserve(start_count);
+    uint32_t histogram[64] = {};
+
+    for (const auto& e : stage_) {
+      if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
+        open_ts[e.call_id] = e.ts;
+      } else if (e.type == kTraceFuncExit || e.type == kTraceAsyncSuspend ||
+                 e.type == kTraceFuncOnStackReplacement) {
+        auto it = open_ts.find(e.call_id);
+        if (it != open_ts.end()) {
+          uint64_t dur = e.ts - it->second;
+          int b = (dur == 0) ? 0 : (63 - __builtin_clzll(dur));
+          histogram[b]++;
+          open_ts.erase(it);
+        }
+      }
+    }
+
+    // ── Compute minimum duration threshold via interpolation ─────────────────
+    // Walk buckets from longest to shortest; find where cumulative kept count
+    // would hit `target`.  Interpolate linearly within the straddling bucket.
+    uint64_t min_duration = [&]() -> uint64_t {
+      uint32_t cum = 0;
+      for (int b = 63; b >= 0; b--) {
+        if (cum + histogram[b] <= target) {
+          cum += histogram[b];
+          continue;
+        }
+        uint32_t needed = target - cum;
+        uint64_t bmin = (b == 0) ? 0ULL : (1ULL << b);
+        uint64_t bmax = (b >= 63) ? UINT64_MAX : (2ULL << b);
+        uint64_t span = bmax - bmin;
+        if (needed == 0 || histogram[b] == 0) return bmax;
+        // Keep the `needed` longest calls in this bucket.
+        // Assuming uniform distribution: threshold = bmax - span*needed/count
+        return bmin + span * (uint64_t)(histogram[b] - needed) / histogram[b];
+      }
+      return 0;  // everything fits (shouldn't reach here since start_count > target)
+    }();
+
+    // ── Build keep_ids: call_ids whose duration meets the threshold ───────────
+    open_ts.clear();
+    for (const auto& e : stage_) {
+      if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
+        open_ts[e.call_id] = e.ts;
+      }
+    }
+
+    std::unordered_set<uint32_t> keep_ids;
+    keep_ids.reserve(target);
+    for (const auto& e : stage_) {
+      if (e.type == kTraceFuncExit || e.type == kTraceAsyncSuspend ||
+          e.type == kTraceFuncOnStackReplacement) {
+        auto it = open_ts.find(e.call_id);
+        if (it == open_ts.end()) {
+          keep_ids.insert(e.call_id);  // cross-boundary: always keep
+        } else if (e.ts - it->second >= min_duration) {
+          keep_ids.insert(e.call_id);
+        }
+      }
+    }
+
+    // ── Pass 2: emit filtered events with EXCLUDED_BATCH for gaps ────────────
+    uint32_t excl = 0;
+
+    for (const auto& e : stage_) {
+      if (e.type == kTraceNewName) {
+        if (excl > 0) { EmitExcludedBatch(e.ts, excl); excl = 0; }
+        EmitStagedToBuf(e);
+      } else if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
+        if (keep_ids.count(e.call_id)) {
+          if (excl > 0) { EmitExcludedBatch(e.ts, excl); excl = 0; }
+          EmitStagedToBuf(e);
+        } else {
+          excl++;
+        }
+      } else if (e.type == kTraceFuncExit || e.type == kTraceAsyncSuspend ||
+                 e.type == kTraceFuncOnStackReplacement) {
+        if (keep_ids.count(e.call_id)) {
+          if (excl > 0) { EmitExcludedBatch(e.ts, excl); excl = 0; }
+          EmitStagedToBuf(e);
+        }
+        // excluded ends are silently dropped (counted at ENTER time)
+      } else if (e.type == kTraceOptimizedBatch) {
+        if (excl > 0) { EmitExcludedBatch(e.ts, excl); excl = 0; }
+        EmitStagedToBuf(e);
+      }
+    }
+
+    if (excl > 0 && !stage_.empty()) {
+      EmitExcludedBatch(stage_.back().ts, excl);
+    }
+
+    stage_.clear();
+  }
+
+  // Emit all staged events without filtering (shutdown / forced drain).
+  __attribute__((noinline)) void FlushStageAll() {
+    for (const auto& ev : stage_) EmitStagedToBuf(ev);
+    stage_.clear();
+  }
+
+  // Emit a synthetic ENTER/EXIT pair named "(trace-flush)" spanning [start,end].
+  // Call after FlushStage() so the timestamps come after all staged events.
+  __attribute__((noinline)) void EmitFlushSyntheticEvent(uint64_t start_ts, uint64_t end_ts) {
+    static const char kName[] = "(trace-flush)";
+    static const int  kNameLen = 13;
+    // Use a sentinel key that can never collide with a real SFI pointer (odd,
+    // below any heap object address).
+    static const void* const kKey = reinterpret_cast<const void*>(uintptr_t{1});
+
+    uint32_t call_id = next_call_id_++;
+    bool is_new;
+    uint32_t idx = name_table_.Upsert(kKey, &is_new);
+    EnsureSpace();
+    if (is_new) {
+      WriteHeader(kTraceNewName, start_ts);
+      W4(idx); W2((uint16_t)kNameLen); WBytes(kName, kNameLen);
+    }
+    EnsureSpace();
+    WriteHeader(kTraceFuncEnter, start_ts);
+    W4(idx); W1(0); W4(call_id);
+    EnsureSpace();
+    WriteHeader(kTraceFuncExit, end_ts);
+    W4(idx); W4(call_id);
+  }
+
  private:
+  // ── Binary write buffer ──────────────────────────────────────────────────────
   uint8_t* buf_;
   uint8_t* ptr_;
   uint8_t* buf_end_;
@@ -270,7 +455,6 @@ class TraceWriter {
       FlushBuffer();
   }
 
-  // ── Raw stores ──────────────────────────────────────────────────────────────
   __attribute__((always_inline)) inline void W1(uint8_t v)  { *ptr_++ = v; }
 
   __attribute__((always_inline)) inline void W2(uint16_t v) {
@@ -295,14 +479,9 @@ class TraceWriter {
     memcpy(ptr_, src, static_cast<size_t>(n)); ptr_ += n;
   }
 
-  // ── Timestamp ───────────────────────────────────────────────────────────────
-  __attribute__((always_inline)) inline uint64_t NowNs() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1'000'000'000ULL + (uint64_t)ts.tv_nsec;
-  }
+  // ── Timestamp delta encoding ─────────────────────────────────────────────────
+  uint64_t last_event_ts_;
 
-  // ── Header: [ss:2 | type:6] + variable-width delta timestamp ────────────────
   __attribute__((always_inline)) inline void WriteHeader(uint8_t type, uint64_t ts) {
     uint64_t delta = ts - last_event_ts_;
     int ss;
@@ -320,58 +499,95 @@ class TraceWriter {
     last_event_ts_ = ts;
   }
 
-  // ── Ensure name is indexed; emit NEW_NAME if first time seen ────────────────
-  // Returns the name_idx to embed in the following call record.
-  // If new: emits a NEW_NAME record with the given ts (call record gets delta=0).
+  // ── Call ID, call stack, staged events ───────────────────────────────────────
+  uint32_t next_call_id_;
+  uint32_t max_per_second_;
+
+  struct StackFrame {
+    uint32_t    call_id;
+    const void* sfi_key;
+    uint32_t    name_idx;
+    uintptr_t   frame_ptr;
+  };
+  std::vector<StackFrame> call_stack_;
+
+  // One entry per event staged for the current 100ms window.
+  // NEW_NAME events carry the name string inline; all others leave new_name empty.
+  struct StagedEvent {
+    TraceEventType type        = kTraceFuncEnter;
+    uint64_t       ts          = 0;
+    uint32_t       name_idx    = 0;
+    uint32_t       call_id     = 0;
+    bool           is_async    = false;
+    uint32_t       batch_count = 0;
+    std::string    new_name;   // non-empty only for kTraceNewName
+  };
+  std::vector<StagedEvent> stage_;
+
+  std::vector<std::string> debug_name_strs_;  // idx→name, only populated in strict mode
+
+  // ── SFI pointer → name index table ──────────────────────────────────────────
+  SfiNameTable name_table_;
+
+  // ── EnsureNamed: assign name_idx and push NEW_NAME to stage_ if first use ───
   __attribute__((always_inline)) inline uint32_t EnsureNamed(
       const void* sfi_key, const char* name, int name_len, uint64_t ts) {
     bool is_new;
     uint32_t idx = name_table_.Upsert(sfi_key, &is_new);
     if (__builtin_expect(is_new, 0)) {
-      WriteHeader(kTraceNewName, ts);
-      W4(idx);
-      W2((uint16_t)name_len);
-      WBytes(name, name_len);
+      std::string name_str = (name && name_len > 0)
+          ? std::string(name, name_len) : std::string("(anonymous)", 11);
       if (StrictMode()) {
         if (idx >= debug_name_strs_.size()) debug_name_strs_.resize(idx + 1);
-        debug_name_strs_[idx] = (name && name_len > 0)
-            ? std::string(name, name_len) : "(anonymous)";
+        debug_name_strs_[idx] = name_str;
       }
+      stage_.push_back({.type     = kTraceNewName,
+                        .ts       = ts,
+                        .name_idx = idx,
+                        .new_name = std::move(name_str)});
     }
     return idx;
   }
 
-  // ── Timestamp of last emitted event ─────────────────────────────────────────
-  uint64_t last_event_ts_;
-
-  // ── Call ID + call stack ─────────────────────────────────────────────────────
-  struct StackFrame { uint32_t call_id; const void* sfi_key; uint32_t name_idx; uintptr_t frame_ptr; };
-  uint32_t                next_call_id_;
-  std::vector<StackFrame> call_stack_;
-  std::vector<std::string> debug_name_strs_;  // idx→name, only in strict mode
-
-  // ── SFI pointer → name index table ──────────────────────────────────────────
-  SfiNameTable name_table_;
-
-  // ── Close all open frames on shutdown ───────────────────────────────────────
-  __attribute__((noinline)) void CloseRemainingFrames() {
-    ForceCloseAbove(-1);
+  // ── Emit one staged event to the binary buffer ───────────────────────────────
+  __attribute__((noinline)) void EmitStagedToBuf(const StagedEvent& ev) {
+    EnsureSpace();
+    switch (ev.type) {
+      case kTraceNewName:
+        WriteHeader(kTraceNewName, ev.ts);
+        W4(ev.name_idx);
+        W2((uint16_t)ev.new_name.size());
+        WBytes(ev.new_name.data(), (int)ev.new_name.size());
+        break;
+      case kTraceFuncEnter:
+        WriteHeader(kTraceFuncEnter, ev.ts);
+        W4(ev.name_idx); W1(ev.is_async ? 1 : 0); W4(ev.call_id);
+        break;
+      case kTraceFuncExit:
+      case kTraceAsyncSuspend:
+      case kTraceAsyncResume:
+      case kTraceFuncOnStackReplacement:
+        WriteHeader(ev.type, ev.ts);
+        W4(ev.name_idx); W4(ev.call_id);
+        break;
+      case kTraceOptimizedBatch:
+      case kTraceExcludedBatch:
+        WriteHeader(ev.type, ev.ts);
+        W4(ev.batch_count);
+        break;
+    }
   }
 
-  // ── Core emitter for EXIT / SUSPEND / RESUME / ON_STACK_REPLACEMENT ─────────
-  __attribute__((always_inline)) inline void EmitFuncEvent(
-      TraceEventType type, const void* sfi_key,
-      const char* name, int name_len, uint32_t call_id) {
+  // Emit an EXCLUDED_BATCH record directly to the binary buffer.
+  __attribute__((always_inline)) inline void EmitExcludedBatch(uint64_t ts, uint32_t count) {
     EnsureSpace();
-    uint64_t ts = NowNs();
-    uint32_t idx = EnsureNamed(sfi_key, name, name_len, ts);
-    WriteHeader(type, ts);
-    W4(idx);
-    W4(call_id);
+    WriteHeader(kTraceExcludedBatch, ts);
+    W4(count);
   }
 
   // ── Stack helpers ────────────────────────────────────────────────────────────
-  // Returns the index of frame_ptr in call_stack_ (searching from top), or -1.
+
+  // Search by Ignition frame pointer (unique per activation).
   int FindInStack(uintptr_t frame_ptr) const {
     for (int i = (int)call_stack_.size() - 1; i >= 0; i--) {
       if (call_stack_[i].frame_ptr == frame_ptr) return i;
@@ -379,8 +595,7 @@ class TraceWriter {
     return -1;
   }
 
-  // Returns the index of sfi_key in call_stack_ (searching from top), or -1.
-  // Used only for OSR matching where frame_ptr is from TurboFan, not Ignition.
+  // Search by SFI key — used only for OSR where the FP is from TurboFan.
   int FindInStackBySfi(const void* sfi_key) const {
     for (int i = (int)call_stack_.size() - 1; i >= 0; i--) {
       if (call_stack_[i].sfi_key == sfi_key) return i;
@@ -388,13 +603,14 @@ class TraceWriter {
     return -1;
   }
 
-  // Emits EXIT for every frame above target_idx, popping as it goes.
+  // Emit EXIT for every frame above target_idx (inclusive of boundary), then pop.
   // Pass target_idx=-1 to close everything.
   __attribute__((noinline)) void ForceCloseAbove(int target_idx) {
     while ((int)call_stack_.size() - 1 > target_idx) {
       const StackFrame f = call_stack_.back();
       call_stack_.pop_back();
-      EmitFuncEvent(kTraceFuncExit, f.sfi_key, nullptr, 0, f.call_id);
+      stage_.push_back({.type = kTraceFuncExit, .ts = NowNs(),
+                        .name_idx = f.name_idx, .call_id = f.call_id});
     }
   }
 
@@ -407,13 +623,13 @@ class TraceWriter {
     return strict;
   }
 
-  // Called when EXIT arrives for a frame_ptr that isn't at the top of the stack.
-  // Not-found (idx<0) means the start was JIT'd — silently ignored, not an error.
-  // Found-but-not-top means we missed intervening exits — close them first.
+  // Called when EXIT arrives for a frame_ptr not at the top of the stack.
+  // Not-found (idx<0): start was JIT'd — silently ignore, not an error.
+  // Found-but-not-top: missed intervening exits — close them, then emit.
   __attribute__((noinline)) void HandleMismatchedExit(
       uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
     int idx = FindInStack(frame_ptr);
-    if (idx < 0) return;  // start was JIT'd, no matching ENTER — ignore
+    if (idx < 0) return;
     if (StrictMode()) {
       int n_above = (int)call_stack_.size() - 1 - idx;
       const char* fn = (name && name_len > 0) ? name
@@ -421,15 +637,8 @@ class TraceWriter {
               ? debug_name_strs_[call_stack_[idx].name_idx].c_str() : "?");
       fprintf(stderr, "NODE_TRACE_STRICT: EXIT for '%s' (callId=%u) not at top — "
               "%d frame(s) above it\n", fn, call_stack_[idx].call_id, n_above);
-      // Print up to 15 ancestor frames (callers of the mismatched function)
-      int anc_start = idx - 1;
-      int anc_show  = 15;
-      if (idx - anc_show > 0) {
-        fprintf(stderr, "  ... (%d more frames below) ...\n", idx - anc_show);
-        anc_start = anc_show - 1;
-      }
-      for (int i = (idx <= anc_show ? idx - 1 : anc_show - 1); i >= 0; i--) {
-        int actual = (idx <= anc_show) ? i : (idx - anc_show + i);
+      for (int i = (idx <= 15 ? idx - 1 : 14); i >= 0; i--) {
+        int actual = (idx <= 15) ? i : (idx - 15 + i);
         const char* frame_name = call_stack_[actual].name_idx < debug_name_strs_.size()
             ? debug_name_strs_[call_stack_[actual].name_idx].c_str() : "?";
         fprintf(stderr, "  [caller %d] callId=%u  %s\n",
@@ -437,20 +646,21 @@ class TraceWriter {
       }
       fprintf(stderr, "  >>> callId=%u  %s  (EXIT mismatch here)\n",
               call_stack_[idx].call_id, fn);
-      // Print all frames above (children still on stack)
       for (int i = idx + 1; i < (int)call_stack_.size(); i++) {
         const char* frame_name = call_stack_[i].name_idx < debug_name_strs_.size()
             ? debug_name_strs_[call_stack_[i].name_idx].c_str() : "?";
         fprintf(stderr, "  [+%d] callId=%u  %s\n",
                 i - idx, call_stack_[i].call_id, frame_name);
       }
-      FlushBuffer();
+      FlushStageAll(); FlushBuffer();
       _exit(1);
     }
     ForceCloseAbove(idx);
-    uint32_t call_id = call_stack_.back().call_id;
+    uint32_t call_id  = call_stack_.back().call_id;
+    uint32_t name_idx = call_stack_.back().name_idx;
     call_stack_.pop_back();
-    EmitFuncEvent(kTraceFuncExit, sfi_key, name, name_len, call_id);
+    stage_.push_back({.type = kTraceFuncExit, .ts = NowNs(),
+                      .name_idx = name_idx, .call_id = call_id});
   }
 
   __attribute__((noinline)) void HandleMismatchedSuspend(
@@ -461,12 +671,15 @@ class TraceWriter {
       fprintf(stderr, "NODE_TRACE_STRICT: SUSPEND for '%s' not at top of stack "
               "(%d frame(s) above it)\n", name,
               (int)call_stack_.size() - 1 - idx);
+      FlushStageAll(); FlushBuffer();
       _exit(1);
     }
     ForceCloseAbove(idx);
-    uint32_t call_id = call_stack_.back().call_id;
+    uint32_t call_id  = call_stack_.back().call_id;
+    uint32_t name_idx = call_stack_.back().name_idx;
     call_stack_.pop_back();
-    EmitFuncEvent(kTraceAsyncSuspend, sfi_key, name, name_len, call_id);
+    stage_.push_back({.type = kTraceAsyncSuspend, .ts = NowNs(),
+                      .name_idx = name_idx, .call_id = call_id});
   }
 };
 

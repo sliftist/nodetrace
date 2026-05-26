@@ -1,19 +1,40 @@
-Max call stack depth: 16
+Max call stack depth: 37
 
 Stack at max depth (bottom → top):
   [0] callId=0  (anonymous)
-  [1] callId=889  evalTypeScript
-  [2] callId=890  get
-  [3] callId=891  (anonymous)
-  [4] callId=894  wrapModuleLoad
-  [5] callId=895  (anonymous)
-  [6] callId=896  (anonymous)
-  [7] callId=897  tracingChannel
-  [8] callId=898  TracingChannel
-  [9] callId=900  BoundedChannel
-  [10] callId=901  channelFromMap
-  [11] callId=902  channel
-  [12] callId=904  Channel
-  [13] callId=905  set
-  [14] callId=906  WeakReference
-  [15] callId=907  WeakReference
+  [1] callId=839  executeUserEntryPoint
+  [2] callId=1029  wrapModuleLoad
+  [3] callId=1095  (anonymous)
+  [4] callId=1146  (anonymous)
+  [5] callId=1178  (anonymous)
+  [6] callId=1199  (anonymous)
+  [7] callId=1216  (anonymous)
+  [8] callId=1217  main
+  [9] callId=1219  log
+  [10] callId=1222  value
+  [11] callId=1223  get
+  [12] callId=1224  getStdout
+  [13] callId=1225  createWritableStdioStream
+  [14] callId=1227  requireBuiltin
+  [15] callId=1228  compileForInternalLoader
+  [16] callId=1229  (anonymous)
+  [17] callId=1232  requireBuiltin
+  [18] callId=1233  compileForInternalLoader
+  [19] callId=1234  (anonymous)
+  [20] callId=1294  requireBuiltin
+  [21] callId=1295  compileForInternalLoader
+  [22] callId=1296  (anonymous)
+  [23] callId=1297  requireBuiltin
+  [24] callId=1298  compileForInternalLoader
+  [25] callId=1299  (anonymous)
+  [26] callId=1311  requireBuiltin
+  [27] callId=1312  compileForInternalLoader
+  [28] callId=1313  (anonymous)
+  [29] callId=1319  requireBuiltin
+  [30] callId=1320  compileForInternalLoader
+  [31] callId=1321  (anonymous)
+  [32] callId=1328  requireBuiltin
+  [33] callId=1329  compileForInternalLoader
+  [34] callId=1330  (anonymous)
+  [35] callId=1331  requireBuiltin
+  [36] callId=1332  compileForInternalLoader

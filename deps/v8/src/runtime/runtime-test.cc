@@ -1681,6 +1681,29 @@ namespace {
 TraceWriter* g_trace_writer = nullptr;
 std::once_flag g_trace_init_flag;
 
+// Opaque storage for uv_timer_t (152 bytes on Linux x64; 256 is safe).
+alignas(8) static char g_uv_timer_buf[256];
+static bool g_flush_timer_initialized = false;
+
+// Weak-linked so mksnapshot (which links v8_base_without_compiler without
+// libuv) doesn't get undefined-reference linker errors.
+extern "C" {
+__attribute__((weak)) void* uv_default_loop(void);
+__attribute__((weak)) int   uv_timer_init(void*, void*);
+__attribute__((weak)) int   uv_timer_start(void*, void(*)(void*), uint64_t, uint64_t);
+__attribute__((weak)) void  uv_unref(void*);
+__attribute__((weak)) int   uv_timer_stop(void*);
+}
+
+static void FlushTimerCb(void*) {
+  if (!g_trace_writer) return;
+  uint64_t flush_start = g_trace_writer->NowNs();
+  g_trace_writer->FlushStage();
+  uint64_t flush_end = g_trace_writer->NowNs();
+  g_trace_writer->EmitFlushSyntheticEvent(flush_start, flush_end);
+  g_trace_writer->FlushBuffer();
+}
+
 // Returns true when the current process is mksnapshot (which runs V8 JS to
 // build the startup snapshot — tracing must be suppressed there because the
 // heap state is not yet fully bootstrapped and the frame iterator can crash).
@@ -1703,7 +1726,19 @@ void MaybeInitTraceWriter() {
         g_trace_writer = nullptr;
         fprintf(stderr, "TraceWriter: failed to open '%s'\n", path);
       } else {
-        atexit([]() { if (g_trace_writer) { delete g_trace_writer; g_trace_writer = nullptr; } });
+        // Flush timer: fires every 100ms between event-loop ticks (clean stack).
+        if (uv_default_loop && uv_timer_init && uv_timer_start) {
+          g_flush_timer_initialized = true;
+          void* loop = uv_default_loop();
+          uv_timer_init(loop, g_uv_timer_buf);
+          uv_timer_start(g_uv_timer_buf, FlushTimerCb, 100, 100);
+          if (uv_unref) uv_unref(g_uv_timer_buf);
+        }
+
+        atexit([]() {
+          if (g_flush_timer_initialized && uv_timer_stop) uv_timer_stop(g_uv_timer_buf);
+          if (g_trace_writer) { delete g_trace_writer; g_trace_writer = nullptr; }
+        });
         // Enable the x64/arm64/... OSR-entry builtin to call
         // Runtime_LogOrTraceOptimizedOSREntry so we can emit FUNC_OSR events.
         v8_flags.log_or_trace_osr = true;

@@ -8,6 +8,7 @@ const EV_RESUME               = 0x03;
 const EV_ON_STACK_REPLACEMENT = 0x04;
 const EV_OPTIMIZED_BATCH      = 0x05;
 const EV_NEWNAME              = 0x06;
+const EV_EXCLUDED_BATCH       = 0x07;
 
 function readTrace(buf) {
   const names = [];
@@ -47,6 +48,9 @@ function readTrace(buf) {
       events.push({ type: 'RESUME', ts, func, callId });
     } else if (type === EV_OPTIMIZED_BATCH) {
       pos += 4;
+    } else if (type === EV_EXCLUDED_BATCH) {
+      const count = u32();
+      events.push({ type: 'EXCLUDED_BATCH', ts, count });
     } else if (type <= EV_ON_STACK_REPLACEMENT) {
       const func = names[u32()] ?? '(unknown)', callId = u32();
       const name = ['ENTER','EXIT','SUSPEND','RESUME','ON_STACK_REPLACEMENT'][type];
@@ -61,7 +65,7 @@ function readTrace(buf) {
 function validate(events, logPath) {
   const stack = [];   // [{callId, func}]
   let errors = 0;
-  let enters = 0, exits = 0, suspends = 0, resumes = 0, osrs = 0;
+  let enters = 0, exits = 0, suspends = 0, resumes = 0, osrs = 0, excluded = 0;
   let maxDepth = 0;
   let maxDepthStack = [];
 
@@ -112,6 +116,8 @@ function validate(events, logPath) {
       osrs++;
       // OSR pops the frame — TurboFan takes over, Ignition won't EXIT it.
       if (checkTop(ev)) stack.pop();
+    } else if (ev.type === 'EXCLUDED_BATCH') {
+      excluded += ev.count;
     }
   }
 
@@ -132,7 +138,7 @@ function validate(events, logPath) {
   ];
   fs.writeFileSync(logPath, lines.join('\n') + '\n');
 
-  return { errors, enters, exits, suspends, resumes, osrs };
+  return { errors, enters, exits, suspends, resumes, osrs, excluded };
 }
 
 const path = process.argv[2];
@@ -144,9 +150,9 @@ const buf = fs.readFileSync(path);
 console.log(`Validating ${path} (${(buf.length/1e6).toFixed(1)} MB)...`);
 
 const events = readTrace(buf);
-const { errors, enters, exits, suspends, resumes, osrs } = validate(events, logPath);
+const { errors, enters, exits, suspends, resumes, osrs, excluded } = validate(events, logPath);
 
-console.log(`  ENTER=${enters.toLocaleString()}  EXIT=${exits.toLocaleString()}  SUSPEND=${suspends.toLocaleString()}  RESUME=${resumes.toLocaleString()}  OSR=${osrs.toLocaleString()}`);
+console.log(`  ENTER=${enters.toLocaleString()}  EXIT=${exits.toLocaleString()}  SUSPEND=${suspends.toLocaleString()}  RESUME=${resumes.toLocaleString()}  OSR=${osrs.toLocaleString()}  EXCLUDED=${excluded.toLocaleString()}`);
 console.log(`  Max stack depth logged to: ${logPath}`);
 if (errors === 0) {
   console.log(`  OK — no ordering errors found`);
