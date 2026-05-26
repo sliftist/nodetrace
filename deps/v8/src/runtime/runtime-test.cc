@@ -1682,7 +1682,7 @@ namespace {
 // ── Binary trace writer (initialized once, used by TraceEnter/TraceExit) ──
 TraceWriter* g_trace_writer = nullptr;
 std::once_flag g_trace_init_flag;
-std::once_flag g_shim_flag;  // for setting globalThis.TRUE_TIME_ALREADY_SHIMMED
+static bool g_shim_done = false;  // for setting globalThis.TRUE_TIME_ALREADY_SHIMMED
 
 // Opaque storage for uv_timer_t (152 bytes on Linux x64; 256 is safe).
 alignas(8) static char g_uv_timer_buf[256];
@@ -1789,52 +1789,51 @@ static inline void DrainOptimizedCount() {
 }
 
 RUNTIME_FUNCTION(Runtime_TraceEnter) {
-  SealHandleScope shs(isolate);
   // args[0] = function_closure (JSFunction) when compiled by the new bytecode
   // generator.  Cached bytecode compiled before this change has 0 args; fall
   // back to JavaScriptStackFrameIterator for those callers.
   MaybeInitTraceWriter();
-  if (!g_trace_writer) return ReadOnlyRoots(isolate).undefined_value();
+  if (!g_trace_writer) {
+    SealHandleScope shs(isolate);
+    return ReadOnlyRoots(isolate).undefined_value();
+  }
 
-  // On the first traced call: set globalThis.TRUE_TIME_ALREADY_SHIMMED and
+  // One-time first-call setup: set globalThis.TRUE_TIME_ALREADY_SHIMMED and
   // attach process.trueTimeOffset / trueTimeTargetOffset / trueTimeForceResync.
-  std::call_once(g_shim_flag, [isolate]() {
+  // Must happen BEFORE SealHandleScope because V8 API calls need a HandleScope.
+  if (!g_shim_done) {
+    g_shim_done = true;
     HandleScope hs(isolate);
     v8::Isolate* v8iso = reinterpret_cast<v8::Isolate*>(isolate);
     v8::Local<v8::Context> ctx = v8iso->GetCurrentContext();
-    if (ctx.IsEmpty()) return;
+    if (!ctx.IsEmpty()) {
+      ctx->Global()->Set(ctx,
+          v8::String::NewFromUtf8Literal(v8iso, "TRUE_TIME_ALREADY_SHIMMED"),
+          v8::True(v8iso)).IsJust();
 
-    // globalThis.TRUE_TIME_ALREADY_SHIMMED = true
-    ctx->Global()->Set(ctx,
-        v8::String::NewFromUtf8Literal(v8iso, "TRUE_TIME_ALREADY_SHIMMED"),
-        v8::True(v8iso)).IsJust();
+      v8::Local<v8::Object> process_obj = ctx->Global()
+          ->Get(ctx, v8::String::NewFromUtf8Literal(v8iso, "process"))
+          .FromMaybe(v8::Local<v8::Value>()).As<v8::Object>();
+      if (!process_obj.IsEmpty() && process_obj->IsObject()) {
+        auto set_fn = [&](const char* name, v8::FunctionCallback cb) {
+          process_obj->Set(ctx,
+              v8::String::NewFromUtf8(v8iso, name).ToLocalChecked(),
+              v8::Function::New(ctx, cb).ToLocalChecked()).IsJust();
+        };
+        set_fn("trueTimeOffset", [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+          info.GetReturnValue().Set(nodetrace::GetCurrentOffset());
+        });
+        set_fn("trueTimeTargetOffset", [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+          info.GetReturnValue().Set(nodetrace::GetTargetOffset());
+        });
+        set_fn("trueTimeForceResync", [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+          info.GetReturnValue().Set(nodetrace::ForceResync());
+        });
+      }
+    }
+  }
 
-    // process.trueTimeOffset()  — current linearly-smeared offset (ms)
-    // process.trueTimeTargetOffset() — most-recent NTP value; bit-identical
-    //                                  across all processes sharing shm
-    // process.trueTimeForceResync()  — blocking NTP re-query; for testing
-    v8::Local<v8::Object> process_obj = ctx->Global()
-        ->Get(ctx, v8::String::NewFromUtf8Literal(v8iso, "process"))
-        .FromMaybe(v8::Local<v8::Value>()).As<v8::Object>();
-    if (process_obj.IsEmpty() || !process_obj->IsObject()) return;
-
-    auto set_fn = [&](const char* name, v8::FunctionCallback cb) {
-      process_obj->Set(ctx,
-          v8::String::NewFromUtf8(v8iso, name).ToLocalChecked(),
-          v8::Function::New(ctx, cb).ToLocalChecked()).IsJust();
-    };
-
-    set_fn("trueTimeOffset", [](const v8::FunctionCallbackInfo<v8::Value>& info) {
-      info.GetReturnValue().Set(nodetrace::GetCurrentOffset());
-    });
-    set_fn("trueTimeTargetOffset", [](const v8::FunctionCallbackInfo<v8::Value>& info) {
-      info.GetReturnValue().Set(nodetrace::GetTargetOffset());
-    });
-    set_fn("trueTimeForceResync", [](const v8::FunctionCallbackInfo<v8::Value>& info) {
-      info.GetReturnValue().Set(nodetrace::ForceResync());
-    });
-  });
-
+  SealHandleScope shs(isolate);
   Tagged<SharedFunctionInfo> sfi;
   if (args.length() >= 1) {
     sfi = Cast<JSFunction>(args[0])->shared();

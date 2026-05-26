@@ -428,6 +428,7 @@ class TraceWriter {
       pending_max_ts = 0;
     };
 
+    uint64_t prev_e_ts = last_flush_ts_;
     for (const auto& e : stage_) {
       if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
         bool keep = (e.call_id < min_id || e.call_id > max_id)
@@ -444,10 +445,12 @@ class TraceWriter {
         if (keep) { emit_pending(e.ts); EmitStagedToBuf(e); }
         else if (e.ts > pending_max_ts) pending_max_ts = e.ts;
       } else if (e.type == kTraceOptimizedBatch) {
+        // JIT batch: start = end of last Ignition event, end = when batch was drained
         pending += e.batch_count;
-        if (e.ts < pending_min_ts) pending_min_ts = e.ts;
+        if (prev_e_ts < pending_min_ts) pending_min_ts = prev_e_ts;
         if (e.ts > pending_max_ts) pending_max_ts = e.ts;
       }
+      prev_e_ts = e.ts;
     }
     if (pending) emit_pending(stage_.back().ts);
 
@@ -458,8 +461,12 @@ class TraceWriter {
 
   // Emit all staged events without filtering (shutdown / forced drain).
   __attribute__((noinline)) void FlushStageAll() {
+    uint64_t prev_ts = last_flush_ts_;
     if (!stage_.empty()) last_flush_ts_ = stage_.back().ts;
-    for (const auto& ev : stage_) EmitStagedToBuf(ev);
+    for (const auto& ev : stage_) {
+      EmitStagedToBuf(ev, prev_ts);
+      prev_ts = ev.ts;
+    }
     stage_.clear();
   }
 
@@ -628,7 +635,10 @@ class TraceWriter {
 
   // ── Emit one staged event to the binary buffer ───────────────────────────────
   // NEW_NAME events are emitted directly in EnsureNamed and never appear in stage_.
-  __attribute__((noinline)) void EmitStagedToBuf(const StagedEvent& ev) {
+  // prev_ts: timestamp of the event before ev in the stage; used for JIT batch
+  // min_ts (the batch spans from the end of the last Ignition event to ev.ts).
+  __attribute__((noinline)) void EmitStagedToBuf(const StagedEvent& ev,
+                                                  uint64_t prev_ts = 0) {
     EnsureSpace();
     switch (ev.type) {
       case kTraceFuncEnter:
@@ -645,8 +655,8 @@ class TraceWriter {
       case kTraceOptimizedBatch:
         WriteHeader(kTraceOptimizedBatch, ev.ts);
         W4(ev.batch_count);
-        W8(ev.ts);  // min_ts (JIT: only one timestamp known)
-        W8(ev.ts);  // max_ts
+        W8(prev_ts ? prev_ts : ev.ts);  // min_ts = end of last Ignition event
+        W8(ev.ts);                       // max_ts = when batch was recorded
         break;
       default: break;
     }
