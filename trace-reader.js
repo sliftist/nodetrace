@@ -22,11 +22,13 @@ const EV_NAME = ['ENTER', 'EXIT', 'SUSPEND', 'RESUME', 'ON_STACK_REPLACEMENT', '
 //   Header byte: [ss:2 | type:6]
 //     ss=0 → 1-byte delta, ss=1 → 2-byte, ss=2 → 4-byte, ss=3 → 8-byte
 //   Delta timestamp (LE, ss bytes) added to running absolute timestamp
+//   All timestamps are nanoseconds since Unix epoch (same epoch as Date.now()).
 //   Fixed fields per type (no tags):
 //     NEW_NAME: name_idx(u32), len(u16), utf-8 bytes
 //     ENTER:    name_idx(u32), is_async(u8), call_id(u32)
 //     EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT: name_idx(u32), call_id(u32)
-//     OPTIMIZED_BATCH: count(u32)
+//     OPTIMIZED_BATCH: count(u32), min_ts(u64), max_ts(u64)
+//       min_ts/max_ts: ns-since-epoch range of dropped calls
 //   name_idx is permanent; reader keeps a flat array names[idx]=string.
 
 function readTrace(buf) {
@@ -80,7 +82,9 @@ function readTrace(buf) {
       events.push({ type: 'ENTER', ts, func, isAsync: !!isAsync, callId });
     } else if (type === EV_OPTIMIZED_BATCH) {
       const count = BigInt(u32());
-      events.push({ type: 'OPTIMIZED_BATCH', ts, count });
+      const minTs = u64();
+      const maxTs = u64();
+      events.push({ type: 'OPTIMIZED_BATCH', ts, count, minTs, maxTs });
     } else if (type <= EV_ON_STACK_REPLACEMENT) {
       const func   = readRef();
       const callId = u32();

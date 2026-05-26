@@ -34,11 +34,14 @@
 //   0x04  FUNC_ON_STACK_REPLACEMENT  name_idx(u32-LE), call_id(u32-LE)
 //
 //   Bookkeeping — no call_id, no stack effect:
-//   0x05  OPTIMIZED_BATCH  count(u32-LE)
+//   0x05  OPTIMIZED_BATCH  count(u32-LE), min_ts(u64-LE), max_ts(u64-LE)
 //            count calls that were not individually recorded: either JIT-compiled
 //            (TurboFan/Maglev/Sparkplug stripped the trace hooks) or dropped by
 //            the INSPECT_MAX_PER_SECOND throttle.  Emitted immediately before the
 //            next kept event; ts = that next event's timestamp.
+//            min_ts: earliest ns-since-epoch ts of any dropped call ENTER.
+//            max_ts: latest ns-since-epoch ts of any dropped call EXIT.
+//            For JIT batches (single ts known): min_ts = max_ts = ts.
 //   0x06  NEW_NAME      name_idx(u32-LE), len(u16-LE), utf-8 bytes
 //            Assigns a permanent index to a function name.  Always emitted
 //            before the first call event that references that name_idx.
@@ -67,7 +70,7 @@
 //   NEW_NAME (len N):                     1 + 1 + 4 + 2 + N = 8+N bytes
 //   ENTER:                                1 + 1 + 4 + 1 + 4 = 11 bytes
 //   EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT: 1 + 1 + 4 + 4 = 10 bytes
-//   OPTIMIZED_BATCH:                      1 + 1 + 4 = 6 bytes
+//   OPTIMIZED_BATCH:                      1 + 1 + 4 + 8 + 8 = 22 bytes
 
 namespace v8 {
 namespace internal {
@@ -198,7 +201,7 @@ class TraceWriter {
   // Public timing helper so the flush-timer callback can bracket the flush.
   __attribute__((always_inline)) inline uint64_t NowNs() {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1'000'000'000ULL + (uint64_t)ts.tv_nsec;
   }
 
@@ -411,12 +414,18 @@ class TraceWriter {
 
     // ── Pass 3: emit, folding excluded + batch counts into OPTIMIZED_BATCH ───
     uint32_t pending = 0;
+    uint64_t pending_min_ts = UINT64_MAX;
+    uint64_t pending_max_ts = 0;
     auto emit_pending = [&](uint64_t ts) __attribute__((always_inline)) {
       if (!pending) return;
       EnsureSpace();
       WriteHeader(kTraceOptimizedBatch, ts);
       W4(pending);
+      W8(pending_min_ts != UINT64_MAX ? pending_min_ts : ts);
+      W8(pending_max_ts != 0 ? pending_max_ts : ts);
       pending = 0;
+      pending_min_ts = UINT64_MAX;
+      pending_max_ts = 0;
     };
 
     for (const auto& e : stage_) {
@@ -424,15 +433,20 @@ class TraceWriter {
         bool keep = (e.call_id < min_id || e.call_id > max_id)
                     || bm[e.call_id - min_id];
         if (keep) { emit_pending(e.ts); EmitStagedToBuf(e); }
-        else       pending++;
+        else {
+          pending++;
+          if (e.ts < pending_min_ts) pending_min_ts = e.ts;
+        }
       } else if (e.type == kTraceFuncExit || e.type == kTraceAsyncSuspend ||
                  e.type == kTraceFuncOnStackReplacement) {
         bool keep = (e.call_id < min_id || e.call_id > max_id)
                     || bm[e.call_id - min_id];
         if (keep) { emit_pending(e.ts); EmitStagedToBuf(e); }
-        // excluded ends silently dropped
+        else if (e.ts > pending_max_ts) pending_max_ts = e.ts;
       } else if (e.type == kTraceOptimizedBatch) {
         pending += e.batch_count;
+        if (e.ts < pending_min_ts) pending_min_ts = e.ts;
+        if (e.ts > pending_max_ts) pending_max_ts = e.ts;
       }
     }
     if (pending) emit_pending(stage_.back().ts);
@@ -631,6 +645,8 @@ class TraceWriter {
       case kTraceOptimizedBatch:
         WriteHeader(kTraceOptimizedBatch, ev.ts);
         W4(ev.batch_count);
+        W8(ev.ts);  // min_ts (JIT: only one timestamp known)
+        W8(ev.ts);  // max_ts
         break;
       default: break;
     }

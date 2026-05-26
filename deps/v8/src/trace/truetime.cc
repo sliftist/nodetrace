@@ -240,37 +240,33 @@ void InitTrueTime() {
 
 bool IsTrueTimeEnabled() { return g_enabled; }
 
-double GetTrueTimeMs() {
-    TimeState s = ReadState();
-    double sys = NowMs();
-
-    // Compute adjusted time (NTP offset applied if available)
-    double time;
-    if (s.update_time == 0.0 || sys < s.last_update_time) {
-        time = sys;  // NTP not yet synced
+// ── Shared interpolation helper ───────────────────────────────────────────────
+// Returns the NTP offset (ms) to add to sys, linearly smeared across the
+// current transition window.  Returns 0 if not yet synced.
+static double ComputeOffset(const TimeState& s, double sys) {
+    if (s.update_time == 0.0 || sys < s.last_update_time) return 0.0;
+    double from_offset, to_offset, from_time, to_time;
+    if (sys < s.update_time) {
+        from_offset = s.last_offset;  to_offset = s.offset;
+        from_time   = s.last_update_time;  to_time = s.update_time;
+    } else if (sys < s.next_update_time) {
+        from_offset = s.offset;       to_offset = s.next_offset;
+        from_time   = s.update_time;  to_time   = s.next_update_time;
     } else {
-        double from_offset, to_offset, from_time, to_time;
-        if (sys < s.update_time) {
-            from_offset = s.last_offset;  to_offset = s.offset;
-            from_time   = s.last_update_time;  to_time = s.update_time;
-        } else if (sys < s.next_update_time) {
-            from_offset = s.offset;       to_offset = s.next_offset;
-            from_time   = s.update_time;  to_time   = s.next_update_time;
-        } else {
-            from_offset = to_offset = s.next_offset;
-            from_time   = to_time   = s.next_update_time;
-        }
-        double duration = to_time - from_time;
-        double frac     = duration > 0.0
-                          ? std::min(1.0, (sys - from_time) / duration)
-                          : 0.0;
-        time = sys + from_offset + (to_offset - from_offset) * frac;
+        return s.next_offset;
     }
+    double duration = to_time - from_time;
+    double frac     = duration > 0.0 ? std::min(1.0, (sys - from_time) / duration) : 0.0;
+    return from_offset + (to_offset - from_offset) * frac;
+}
+
+double GetTrueTimeMs() {
+    TimeState s  = ReadState();
+    double sys   = NowMs();
+    double time  = sys + ComputeOffset(s, sys);
 
     // Hard monotonic guarantee: never return a value smaller than the previous
-    // call on this thread. When the adjusted time would go backward (e.g. NTP
-    // correction or CLOCK_REALTIME jitter), slow-roll forward at kMinTimeRate
-    // if the system clock advanced, otherwise hold steady.
+    // call on this thread.
     thread_local double last_time      = 0.0;
     thread_local double last_base_time = 0.0;
     if (last_time != 0.0 && time < last_time) {
@@ -280,6 +276,22 @@ double GetTrueTimeMs() {
     last_time      = time;
     last_base_time = sys;
     return time;
+}
+
+double GetCurrentOffset() {
+    TimeState s = ReadState();
+    return ComputeOffset(s, NowMs());
+}
+
+double GetTargetOffset() {
+    // next_offset is the most recently NTP-queried value and is stored verbatim
+    // in shared memory, so all processes reading it get bit-identical doubles.
+    return ReadState().next_offset;
+}
+
+double ForceResync() {
+    SyncTime();  // blocking: NTP query (up to ~9s) then write to shm
+    return GetTargetOffset();
 }
 
 }  // namespace nodetrace

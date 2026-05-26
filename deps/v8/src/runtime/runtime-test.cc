@@ -1796,17 +1796,43 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
   MaybeInitTraceWriter();
   if (!g_trace_writer) return ReadOnlyRoots(isolate).undefined_value();
 
-  // Set globalThis.TRUE_TIME_ALREADY_SHIMMED = true on the first traced call
-  // so the trueTimeShim.ts skips replacing Date.now (we already replaced it).
+  // On the first traced call: set globalThis.TRUE_TIME_ALREADY_SHIMMED and
+  // attach process.trueTimeOffset / trueTimeTargetOffset / trueTimeForceResync.
   std::call_once(g_shim_flag, [isolate]() {
     HandleScope hs(isolate);
     v8::Isolate* v8iso = reinterpret_cast<v8::Isolate*>(isolate);
     v8::Local<v8::Context> ctx = v8iso->GetCurrentContext();
-    if (!ctx.IsEmpty()) {
-      v8::Local<v8::String> key = v8::String::NewFromUtf8Literal(
-          v8iso, "TRUE_TIME_ALREADY_SHIMMED");
-      ctx->Global()->Set(ctx, key, v8::True(v8iso)).IsJust();
-    }
+    if (ctx.IsEmpty()) return;
+
+    // globalThis.TRUE_TIME_ALREADY_SHIMMED = true
+    ctx->Global()->Set(ctx,
+        v8::String::NewFromUtf8Literal(v8iso, "TRUE_TIME_ALREADY_SHIMMED"),
+        v8::True(v8iso)).IsJust();
+
+    // process.trueTimeOffset()  — current linearly-smeared offset (ms)
+    // process.trueTimeTargetOffset() — most-recent NTP value; bit-identical
+    //                                  across all processes sharing shm
+    // process.trueTimeForceResync()  — blocking NTP re-query; for testing
+    v8::Local<v8::Object> process_obj = ctx->Global()
+        ->Get(ctx, v8::String::NewFromUtf8Literal(v8iso, "process"))
+        .FromMaybe(v8::Local<v8::Value>()).As<v8::Object>();
+    if (process_obj.IsEmpty() || !process_obj->IsObject()) return;
+
+    auto set_fn = [&](const char* name, v8::FunctionCallback cb) {
+      process_obj->Set(ctx,
+          v8::String::NewFromUtf8(v8iso, name).ToLocalChecked(),
+          v8::Function::New(ctx, cb).ToLocalChecked()).IsJust();
+    };
+
+    set_fn("trueTimeOffset", [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+      info.GetReturnValue().Set(nodetrace::GetCurrentOffset());
+    });
+    set_fn("trueTimeTargetOffset", [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+      info.GetReturnValue().Set(nodetrace::GetTargetOffset());
+    });
+    set_fn("trueTimeForceResync", [](const v8::FunctionCallbackInfo<v8::Value>& info) {
+      info.GetReturnValue().Set(nodetrace::ForceResync());
+    });
   });
 
   Tagged<SharedFunctionInfo> sfi;

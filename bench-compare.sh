@@ -7,6 +7,14 @@
 #   /opt/bin/node      — vanilla Node.js v26
 #   ./out/Release/node — patched nodetrace build
 #   /tmp/zod/          — zod source (cloned by gen-traces.sh if missing)
+#
+# Trace files are written to the repo root with rate-in-filename:
+#   workload.bin            — default compiled rate (100000/sec), no override
+#   workload_1000.bin       — INSPECT_MAX_PER_SECOND=1000
+#   workload_10000.bin      — INSPECT_MAX_PER_SECOND=10000
+#   workload_100000.bin     — INSPECT_MAX_PER_SECOND=100000  (== workload.bin)
+#   workload_1000000.bin    — INSPECT_MAX_PER_SECOND=1000000
+#   (same naming for bench_overhead and zod)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -66,8 +74,13 @@ echo "  ────────────────────────
 print_row "vanilla v26 (no trace)"     "$(best_ms "$VANILLA bench-overhead.js")"
 print_row "patched v27 (no trace)"     "$(best_ms "$PATCHED bench-overhead.js")"
 
+# Default: no INSPECT_MAX_PER_SECOND override (compiled default = 100000/sec)
+f="./bench_overhead.bin"
+ms=$(best_ms "NODE_TRACE_FILE=$f $PATCHED bench-overhead.js")
+print_row "patched v27 trace (default)" "$ms" "  $(trace_stats "$f")"
+
 for lim in 1000 10000 100000 1000000; do
-  f="/tmp/boh_${lim}.bin"
+  f="./bench_overhead_${lim}.bin"
   ms=$(best_ms "INSPECT_MAX_PER_SECOND=$lim NODE_TRACE_FILE=$f $PATCHED bench-overhead.js")
   print_row "patched v27 trace ${lim}/sec" "$ms" "  $(trace_stats "$f")"
 done
@@ -90,8 +103,12 @@ rm -rf ~/.cache/node/compile-cache 2>/dev/null || true
 print_row "vanilla v26 (no trace)"     "$(best_ms "$VANILLA $ZOD_CMD")"
 print_row "patched v27 (no trace)"     "$(best_ms "$PATCHED $ZOD_CMD")"
 
+f="./zod.bin"
+ms=$(best_ms "NODE_TRACE_FILE=$f $PATCHED $ZOD_CMD")
+print_row "patched v27 trace (default)" "$ms" "  $(trace_stats "$f")"
+
 for lim in 1000 10000 100000 1000000; do
-  f="/tmp/bzod_${lim}.bin"
+  f="./zod_${lim}.bin"
   ms=$(best_ms "INSPECT_MAX_PER_SECOND=$lim NODE_TRACE_FILE=$f $PATCHED $ZOD_CMD")
   print_row "patched v27 trace ${lim}/sec" "$ms" "  $(trace_stats "$f")"
 done
@@ -107,8 +124,12 @@ echo "  ────────────────────────
 
 print_row "patched v27 (no trace)"     "$(best_ms "$PATCHED workload.js")"
 
+f="./workload.bin"
+ms=$(best_ms "NODE_TRACE_FILE=$f $PATCHED workload.js")
+print_row "patched v27 trace (default)" "$ms" "  $(trace_stats "$f")"
+
 for lim in 1000 10000 100000 1000000; do
-  f="/tmp/bwl_${lim}.bin"
+  f="./workload_${lim}.bin"
   ms=$(best_ms "INSPECT_MAX_PER_SECOND=$lim NODE_TRACE_FILE=$f $PATCHED workload.js")
   print_row "patched v27 trace ${lim}/sec" "$ms" "  $(trace_stats "$f")"
 done
