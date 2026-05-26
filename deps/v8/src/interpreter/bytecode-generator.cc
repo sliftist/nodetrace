@@ -1793,7 +1793,9 @@ void BytecodeGenerator::GenerateBodyPrologue() {
   FunctionLiteral* literal = info()->literal();
   // Always emit function-enter trace call; the writer is gated on
   // NODE_TRACE_FILE being set, so there is no overhead when not tracing.
-  builder()->CallRuntime(Runtime::kTraceEnter);
+  // Pass function_closure as arg so Runtime_TraceEnter can read the SFI
+  // directly instead of using JavaScriptStackFrameIterator.
+  builder()->CallRuntime(Runtime::kTraceEnter, Register::function_closure());
 
   // Increment the function-scope block coverage counter.
   BuildIncrementBlockCoverageCounterIfEnabled(literal, SourceRangeKind::kBody);

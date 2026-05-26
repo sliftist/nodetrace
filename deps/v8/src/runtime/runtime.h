@@ -677,7 +677,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(StringWrapperToPrimitiveProtector, 0, 1)                             \
   F(SystemBreak, 0, 1)                                                   \
   F(TakeHeapSnapshot, -1, 1)                                             \
-  F(TraceEnter, 0, 1)                                                    \
+  F(TraceEnter, 1, 1)                                                    \
   F(TraceExit, 1, 1)                                                     \
   F(TraceAsyncSuspend, 1, 1)                                             \
   F(TraceAsyncResume, 1, 1)                                              \

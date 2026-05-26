@@ -205,50 +205,44 @@ class TraceWriter {
   // ── Trace event writers — push to stage_, call_stack_ tracked in real-time ──
 
   __attribute__((always_inline)) inline void WriteFuncEnter(
-      const void* sfi_key, const char* name, int name_len, bool is_async,
-      uintptr_t frame_ptr) {
+      const void* sfi_key, const char* name, int name_len, bool is_async) {
     uint32_t call_id = next_call_id_++;
+    uint32_t idx = EnsureNamed(sfi_key, name, name_len);
     uint64_t ts = NowNs();
-    uint32_t idx = EnsureNamed(sfi_key, name, name_len, ts);
-    call_stack_.push_back({call_id, sfi_key, idx, frame_ptr});
-    stage_.push_back({.type = kTraceFuncEnter, .ts = ts,
-                      .name_idx = idx, .call_id = call_id, .is_async = is_async});
+    call_stack_.push_back({call_id, sfi_key, idx});
+    stage_.push_back({.ts = ts, .name_idx = idx, .call_id = call_id,
+                      .type = kTraceFuncEnter, .is_async = (uint8_t)(is_async ? 1 : 0)});
   }
 
-  __attribute__((always_inline)) inline void WriteFuncExit(
-      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
-    if (!call_stack_.empty() && call_stack_.back().frame_ptr == frame_ptr) {
-      uint32_t call_id  = call_stack_.back().call_id;
-      uint32_t name_idx = call_stack_.back().name_idx;
-      call_stack_.pop_back();
-      stage_.push_back({.type = kTraceFuncExit, .ts = NowNs(),
-                        .name_idx = name_idx, .call_id = call_id});
-      return;
-    }
-    HandleMismatchedExit(frame_ptr, sfi_key, name, name_len);
+  // Pops the top of call_stack_. Ignition always EXITs in LIFO order so no
+  // frame-pointer matching is needed.
+  __attribute__((always_inline)) inline void WriteFuncExit() {
+    if (call_stack_.empty()) return;
+    uint32_t call_id  = call_stack_.back().call_id;
+    uint32_t name_idx = call_stack_.back().name_idx;
+    call_stack_.pop_back();
+    stage_.push_back({.ts = NowNs(), .name_idx = name_idx, .call_id = call_id,
+                      .type = kTraceFuncExit});
   }
 
   __attribute__((noinline)) void WriteAsyncSuspend(
-      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
-    if (!call_stack_.empty() && call_stack_.back().frame_ptr == frame_ptr) {
-      uint32_t call_id  = call_stack_.back().call_id;
-      uint32_t name_idx = call_stack_.back().name_idx;
-      call_stack_.pop_back();
-      stage_.push_back({.type = kTraceAsyncSuspend, .ts = NowNs(),
-                        .name_idx = name_idx, .call_id = call_id});
-      return;
-    }
-    HandleMismatchedSuspend(frame_ptr, sfi_key, name, name_len);
+      const void* sfi_key, const char* name, int name_len) {
+    if (call_stack_.empty()) return;
+    uint32_t call_id  = call_stack_.back().call_id;
+    uint32_t name_idx = call_stack_.back().name_idx;
+    call_stack_.pop_back();
+    stage_.push_back({.ts = NowNs(), .name_idx = name_idx, .call_id = call_id,
+                      .type = kTraceAsyncSuspend});
   }
 
   __attribute__((noinline)) void WriteAsyncResume(
-      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
+      const void* sfi_key, const char* name, int name_len) {
     uint32_t call_id = next_call_id_++;
+    uint32_t idx = EnsureNamed(sfi_key, name, name_len);
     uint64_t ts = NowNs();
-    uint32_t idx = EnsureNamed(sfi_key, name, name_len, ts);
-    call_stack_.push_back({call_id, sfi_key, idx, frame_ptr});
-    stage_.push_back({.type = kTraceAsyncResume, .ts = ts,
-                      .name_idx = idx, .call_id = call_id});
+    call_stack_.push_back({call_id, sfi_key, idx});
+    stage_.push_back({.ts = ts, .name_idx = idx, .call_id = call_id,
+                      .type = kTraceAsyncResume});
   }
 
   __attribute__((noinline)) void WriteOnStackReplacement(
@@ -258,8 +252,8 @@ class TraceWriter {
       uint32_t call_id  = call_stack_.back().call_id;
       uint32_t name_idx = call_stack_.back().name_idx;
       call_stack_.pop_back();
-      stage_.push_back({.type = kTraceFuncOnStackReplacement, .ts = NowNs(),
-                        .name_idx = name_idx, .call_id = call_id});
+      stage_.push_back({.ts = NowNs(), .name_idx = name_idx, .call_id = call_id,
+                        .type = kTraceFuncOnStackReplacement});
       return;
     }
     int idx = FindInStackBySfi(sfi_key);
@@ -278,8 +272,8 @@ class TraceWriter {
   }
 
   void WriteOptimizedBatch(uint64_t count) {
-    stage_.push_back({.type = kTraceOptimizedBatch, .ts = NowNs(),
-                      .batch_count = static_cast<uint32_t>(count)});
+    stage_.push_back({.ts = NowNs(), .batch_count = static_cast<uint32_t>(count),
+                      .type = kTraceOptimizedBatch});
   }
 
   // ── Buffer I/O ──────────────────────────────────────────────────────────────
@@ -426,10 +420,7 @@ class TraceWriter {
     };
 
     for (const auto& e : stage_) {
-      if (e.type == kTraceNewName) {
-        emit_pending(e.ts);
-        EmitStagedToBuf(e);
-      } else if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
+      if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
         bool keep = (e.call_id < min_id || e.call_id > max_id)
                     || bm[e.call_id - min_id];
         if (keep) { emit_pending(e.ts); EmitStagedToBuf(e); }
@@ -575,21 +566,22 @@ class TraceWriter {
     uint32_t    call_id;
     const void* sfi_key;
     uint32_t    name_idx;
-    uintptr_t   frame_ptr;
   };
   std::vector<StackFrame> call_stack_;
 
   // One entry per event staged for the current 100ms window.
-  // NEW_NAME events carry the name string inline; all others leave new_name empty.
+  // NEW_NAME events are emitted directly to buf_ (never staged) so new_name
+  // is not needed here.  24-byte struct fits 2.5× more events per cache line.
   struct StagedEvent {
-    TraceEventType type        = kTraceFuncEnter;
     uint64_t       ts          = 0;
     uint32_t       name_idx    = 0;
     uint32_t       call_id     = 0;
-    bool           is_async    = false;
     uint32_t       batch_count = 0;
-    std::string    new_name;   // non-empty only for kTraceNewName
+    TraceEventType type        = kTraceFuncEnter;
+    uint8_t        is_async    = 0;
+    uint16_t       _pad        = 0;
   };
+  static_assert(sizeof(StagedEvent) == 24, "StagedEvent must be 24 bytes");
   std::vector<StagedEvent> stage_;
 
   std::vector<std::string> debug_name_strs_;  // idx→name, only populated in strict mode
@@ -597,39 +589,37 @@ class TraceWriter {
   // ── SFI pointer → name index table ──────────────────────────────────────────
   SfiNameTable name_table_;
 
-  // ── EnsureNamed: assign name_idx and push NEW_NAME to stage_ if first use ───
+  // ── EnsureNamed: assign name_idx, emit NEW_NAME directly to buf_ on first use.
+  // NEW_NAME is emitted with ts=last_event_ts_ (zero delta from previous buf_
+  // write) so that staged events with earlier timestamps still produce positive
+  // deltas when FlushStage emits them later.
   __attribute__((always_inline)) inline uint32_t EnsureNamed(
-      const void* sfi_key, const char* name, int name_len, uint64_t ts) {
+      const void* sfi_key, const char* name, int name_len) {
     bool is_new;
     uint32_t idx = name_table_.Upsert(sfi_key, &is_new);
     if (__builtin_expect(is_new, 0)) {
-      std::string name_str = (name && name_len > 0)
-          ? std::string(name, name_len) : std::string("(anonymous)", 11);
+      if (!name || name_len == 0) { name = "(anonymous)"; name_len = 11; }
       if (StrictMode()) {
         if (idx >= debug_name_strs_.size()) debug_name_strs_.resize(idx + 1);
-        debug_name_strs_[idx] = name_str;
+        debug_name_strs_[idx] = std::string(name, name_len);
       }
-      stage_.push_back({.type     = kTraceNewName,
-                        .ts       = ts,
-                        .name_idx = idx,
-                        .new_name = std::move(name_str)});
+      EnsureSpace();
+      WriteHeader(kTraceNewName, last_event_ts_);
+      W4(idx);
+      W2((uint16_t)name_len);
+      WBytes(name, name_len);
     }
     return idx;
   }
 
   // ── Emit one staged event to the binary buffer ───────────────────────────────
+  // NEW_NAME events are emitted directly in EnsureNamed and never appear in stage_.
   __attribute__((noinline)) void EmitStagedToBuf(const StagedEvent& ev) {
     EnsureSpace();
     switch (ev.type) {
-      case kTraceNewName:
-        WriteHeader(kTraceNewName, ev.ts);
-        W4(ev.name_idx);
-        W2((uint16_t)ev.new_name.size());
-        WBytes(ev.new_name.data(), (int)ev.new_name.size());
-        break;
       case kTraceFuncEnter:
         WriteHeader(kTraceFuncEnter, ev.ts);
-        W4(ev.name_idx); W1(ev.is_async ? 1 : 0); W4(ev.call_id);
+        W4(ev.name_idx); W1(ev.is_async); W4(ev.call_id);
         break;
       case kTraceFuncExit:
       case kTraceAsyncSuspend:
@@ -642,18 +632,11 @@ class TraceWriter {
         WriteHeader(kTraceOptimizedBatch, ev.ts);
         W4(ev.batch_count);
         break;
+      default: break;
     }
   }
 
   // ── Stack helpers ────────────────────────────────────────────────────────────
-
-  // Search by Ignition frame pointer (unique per activation).
-  int FindInStack(uintptr_t frame_ptr) const {
-    for (int i = (int)call_stack_.size() - 1; i >= 0; i--) {
-      if (call_stack_[i].frame_ptr == frame_ptr) return i;
-    }
-    return -1;
-  }
 
   // Search by SFI key — used only for OSR where the FP is from TurboFan.
   int FindInStackBySfi(const void* sfi_key) const {
@@ -669,8 +652,8 @@ class TraceWriter {
     while ((int)call_stack_.size() - 1 > target_idx) {
       const StackFrame f = call_stack_.back();
       call_stack_.pop_back();
-      stage_.push_back({.type = kTraceFuncExit, .ts = NowNs(),
-                        .name_idx = f.name_idx, .call_id = f.call_id});
+      stage_.push_back({.ts = NowNs(), .name_idx = f.name_idx, .call_id = f.call_id,
+                        .type = kTraceFuncExit});
     }
   }
 
@@ -683,65 +666,8 @@ class TraceWriter {
     return strict;
   }
 
-  // Called when EXIT arrives for a frame_ptr not at the top of the stack.
-  // Not-found (idx<0): start was JIT'd — silently ignore, not an error.
-  // Found-but-not-top: missed intervening exits — close them, then emit.
-  __attribute__((noinline)) void HandleMismatchedExit(
-      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
-    int idx = FindInStack(frame_ptr);
-    if (idx < 0) return;
-    if (StrictMode()) {
-      int n_above = (int)call_stack_.size() - 1 - idx;
-      const char* fn = (name && name_len > 0) ? name
-          : (call_stack_[idx].name_idx < debug_name_strs_.size()
-              ? debug_name_strs_[call_stack_[idx].name_idx].c_str() : "?");
-      fprintf(stderr, "NODE_TRACE_STRICT: EXIT for '%s' (callId=%u) not at top — "
-              "%d frame(s) above it\n", fn, call_stack_[idx].call_id, n_above);
-      for (int i = (idx <= 15 ? idx - 1 : 14); i >= 0; i--) {
-        int actual = (idx <= 15) ? i : (idx - 15 + i);
-        const char* frame_name = call_stack_[actual].name_idx < debug_name_strs_.size()
-            ? debug_name_strs_[call_stack_[actual].name_idx].c_str() : "?";
-        fprintf(stderr, "  [caller %d] callId=%u  %s\n",
-                idx - actual, call_stack_[actual].call_id, frame_name);
-      }
-      fprintf(stderr, "  >>> callId=%u  %s  (EXIT mismatch here)\n",
-              call_stack_[idx].call_id, fn);
-      for (int i = idx + 1; i < (int)call_stack_.size(); i++) {
-        const char* frame_name = call_stack_[i].name_idx < debug_name_strs_.size()
-            ? debug_name_strs_[call_stack_[i].name_idx].c_str() : "?";
-        fprintf(stderr, "  [+%d] callId=%u  %s\n",
-                i - idx, call_stack_[i].call_id, frame_name);
-      }
-      FlushStageAll(); FlushBuffer();
-      _exit(1);
-    }
-    ForceCloseAbove(idx);
-    uint32_t call_id  = call_stack_.back().call_id;
-    uint32_t name_idx = call_stack_.back().name_idx;
-    call_stack_.pop_back();
-    stage_.push_back({.type = kTraceFuncExit, .ts = NowNs(),
-                      .name_idx = name_idx, .call_id = call_id});
-  }
-
-  __attribute__((noinline)) void HandleMismatchedSuspend(
-      uintptr_t frame_ptr, const void* sfi_key, const char* name, int name_len) {
-    int idx = FindInStack(frame_ptr);
-    if (idx < 0) return;
-    if (StrictMode()) {
-      fprintf(stderr, "NODE_TRACE_STRICT: SUSPEND for '%s' not at top of stack "
-              "(%d frame(s) above it)\n", name,
-              (int)call_stack_.size() - 1 - idx);
-      FlushStageAll(); FlushBuffer();
-      _exit(1);
-    }
-    ForceCloseAbove(idx);
-    uint32_t call_id  = call_stack_.back().call_id;
-    uint32_t name_idx = call_stack_.back().name_idx;
-    call_stack_.pop_back();
-    stage_.push_back({.type = kTraceAsyncSuspend, .ts = NowNs(),
-                      .name_idx = name_idx, .call_id = call_id});
-  }
 };
+
 
 }  // namespace internal
 }  // namespace v8

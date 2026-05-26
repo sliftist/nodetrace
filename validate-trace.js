@@ -62,11 +62,14 @@ function validate(events, logPath) {
   const stack = [];   // [{callId, func}]
   let errors = 0;
   let enters = 0, exits = 0, suspends = 0, resumes = 0, osrs = 0;
+  let orphanEnds = 0;      // END with no matching callId anywhere in the stack
+  let wrongOrderEnds = 0;  // END where callId is in the stack but not at top
   let maxDepth = 0;
   let maxDepthStack = [];
 
-  const checkTop = (ev) => {
+  const endEvent = (ev) => {
     if (stack.length === 0) {
+      orphanEnds++;
       console.error(`ERROR: ${ev.type} callId=${ev.callId} func=${ev.func} on empty stack`);
       errors++;
       return false;
@@ -75,8 +78,10 @@ function validate(events, logPath) {
     if (top.callId !== ev.callId) {
       const idx = stack.findLastIndex(f => f.callId === ev.callId);
       if (idx < 0) {
+        orphanEnds++;
         console.error(`ERROR: ${ev.type} callId=${ev.callId} func=${ev.func} not found in stack (depth=${stack.length})`);
       } else {
+        wrongOrderEnds++;
         console.error(`ERROR: ${ev.type} callId=${ev.callId} func=${ev.func} not at top — ` +
           `${stack.length - 1 - idx} frame(s) above it (top is callId=${top.callId} func=${top.func})`);
       }
@@ -100,10 +105,10 @@ function validate(events, logPath) {
       trackDepth();
     } else if (ev.type === 'EXIT') {
       exits++;
-      if (checkTop(ev)) stack.pop();
+      if (endEvent(ev)) stack.pop();
     } else if (ev.type === 'SUSPEND') {
       suspends++;
-      if (checkTop(ev)) stack.pop();
+      if (endEvent(ev)) stack.pop();
     } else if (ev.type === 'RESUME') {
       resumes++;
       stack.push({ callId: ev.callId, func: ev.func });
@@ -111,7 +116,7 @@ function validate(events, logPath) {
     } else if (ev.type === 'ON_STACK_REPLACEMENT') {
       osrs++;
       // OSR pops the frame — TurboFan takes over, Ignition won't EXIT it.
-      if (checkTop(ev)) stack.pop();
+      if (endEvent(ev)) stack.pop();
     }
   }
 
@@ -132,7 +137,7 @@ function validate(events, logPath) {
   ];
   fs.writeFileSync(logPath, lines.join('\n') + '\n');
 
-  return { errors, enters, exits, suspends, resumes, osrs };
+  return { errors, enters, exits, suspends, resumes, osrs, orphanEnds, wrongOrderEnds };
 }
 
 const path = process.argv[2];
@@ -144,9 +149,10 @@ const buf = fs.readFileSync(path);
 console.log(`Validating ${path} (${(buf.length/1e6).toFixed(1)} MB)...`);
 
 const events = readTrace(buf);
-const { errors, enters, exits, suspends, resumes, osrs } = validate(events, logPath);
+const { errors, enters, exits, suspends, resumes, osrs, orphanEnds, wrongOrderEnds } = validate(events, logPath);
 
 console.log(`  ENTER=${enters.toLocaleString()}  EXIT=${exits.toLocaleString()}  SUSPEND=${suspends.toLocaleString()}  RESUME=${resumes.toLocaleString()}  OSR=${osrs.toLocaleString()}`);
+console.log(`  orphan-ends (no start)=${orphanEnds.toLocaleString()}  wrong-order-ends (start buried)=${wrongOrderEnds.toLocaleString()}`);
 console.log(`  Max stack depth logged to: ${logPath}`);
 if (errors === 0) {
   console.log(`  OK — no ordering errors found`);

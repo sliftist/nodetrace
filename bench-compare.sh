@@ -31,11 +31,15 @@ best_ms() {
 
 trace_stats() {
   local bin="$1"
-  local sz enter total
+  local sz decoded enter batched
   sz=$(( $(stat -c%s "$bin") / 1024 ))
-  enter=$(node trace-reader.js "$bin" 2>&1 | grep "^  ENTER " | grep -oP '[\d,]+' | tr -d ',' | head -1)
-  total=$(node trace-reader.js "$bin" 2>&1 | grep "Total accounted" | grep -oP '[\d,]+' | tr -d ',' | head -1)
-  printf "%6dKB  enter=%-10s total=%s" "$sz" "${enter:-?}" "${total:-?}"
+  local reader_out
+  reader_out=$(node trace-reader.js "$bin" 2>&1)
+  decoded=$(echo "$reader_out" | grep "^Decoded"          | grep -oP '[\d,]+'   | tr -d ',' | head -1)
+  enter=$(  echo "$reader_out" | grep "Ignition calls"    | grep -oP '[\d,]+'   | tr -d ',' | head -1)
+  batched=$(echo "$reader_out" | grep "Optimized calls"   | grep -oP '[\d,]+'   | tr -d ',' | head -1)
+  printf "%6dKB  events=%-9s enter=%-10s batched=%s" \
+    "$sz" "${decoded:-?}" "${enter:-?}" "${batched:-?}"
 }
 
 print_row() {
@@ -78,6 +82,10 @@ printf "  %-28s %5s\n" "configuration" "best/${RUNS}"
 echo "  ────────────────────────────────────────────────────────────────────"
 
 ZOD_CMD="$TSC -p $ZOD_DIR/tsconfig.bench.json"
+
+# tsc uses enableCompileCache() which loads cached bytecode from disk.
+# Wipe it so the patched node's new 1-arg TraceEnter bytecode is used fresh.
+rm -rf ~/.cache/node/compile-cache 2>/dev/null || true
 
 print_row "vanilla v26 (no trace)"     "$(best_ms "$VANILLA $ZOD_CMD")"
 print_row "patched v27 (no trace)"     "$(best_ms "$PATCHED $ZOD_CMD")"

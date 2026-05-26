@@ -48,6 +48,7 @@
 #include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/js-atomics-synchronization-inl.h"
 #include "src/objects/js-function-inl.h"
+#include "src/objects/js-generator-inl.h"
 #include "src/objects/js-regexp-inl.h"
 #include "src/objects/smi.h"
 #include "src/profiler/heap-snapshot-generator.h"
@@ -1785,26 +1786,30 @@ static inline void DrainOptimizedCount() {
 
 RUNTIME_FUNCTION(Runtime_TraceEnter) {
   SealHandleScope shs(isolate);
-  CHECK_UNLESS_FUZZING(args.length() == 0);
+  // args[0] = function_closure (JSFunction) when compiled by the new bytecode
+  // generator.  Cached bytecode compiled before this change has 0 args; fall
+  // back to JavaScriptStackFrameIterator for those callers.
   MaybeInitTraceWriter();
   if (!g_trace_writer) return ReadOnlyRoots(isolate).undefined_value();
-  JavaScriptStackFrameIterator it(isolate);
-  if (!it.done()) {
-    uintptr_t fp = it.frame()->fp();
-    Tagged<JSFunction> func = it.frame()->function();
-    Tagged<SharedFunctionInfo> sfi = func->shared();
-    const void* key = reinterpret_cast<const void*>(sfi.ptr());
-    bool is_async = IsAsyncFunction(sfi->kind());
-    DrainOptimizedCount();
-    if (g_trace_writer->HasName(key)) {
-      g_trace_writer->WriteFuncEnter(key, nullptr, 0, is_async, fp);
-    } else {
-      std::unique_ptr<char[]> name = sfi->DebugNameCStr();
-      const char* nm = name.get();
-      int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
-      if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
-      g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async, fp);
-    }
+  Tagged<SharedFunctionInfo> sfi;
+  if (args.length() >= 1) {
+    sfi = Cast<JSFunction>(args[0])->shared();
+  } else {
+    JavaScriptStackFrameIterator it(isolate);
+    if (it.done()) return ReadOnlyRoots(isolate).undefined_value();
+    sfi = it.frame()->function()->shared();
+  }
+  const void* key = reinterpret_cast<const void*>(sfi.ptr());
+  bool is_async = IsAsyncFunction(sfi->kind());
+  DrainOptimizedCount();
+  if (g_trace_writer->HasName(key)) {
+    g_trace_writer->WriteFuncEnter(key, nullptr, 0, is_async);
+  } else {
+    std::unique_ptr<char[]> name = sfi->DebugNameCStr();
+    const char* nm = name.get();
+    int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
+    if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
+    g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async);
   }
   return ReadOnlyRoots(isolate).undefined_value();
 }
@@ -1815,39 +1820,20 @@ RUNTIME_FUNCTION(Runtime_TraceExit) {
   Tagged<Object> obj = args[0];
   MaybeInitTraceWriter();
   if (!g_trace_writer) return obj;
-  JavaScriptStackFrameIterator it(isolate);
-  if (!it.done()) {
-    uintptr_t fp = it.frame()->fp();
-    Tagged<JSFunction> func = it.frame()->function();
-    Tagged<SharedFunctionInfo> sfi = func->shared();
-    const void* key = reinterpret_cast<const void*>(sfi.ptr());
-    DrainOptimizedCount();
-    if (g_trace_writer->HasName(key)) {
-      g_trace_writer->WriteFuncExit(fp, key, nullptr, 0);
-    } else {
-      std::unique_ptr<char[]> name = sfi->DebugNameCStr();
-      const char* nm = name.get();
-      int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
-      if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
-      g_trace_writer->WriteFuncExit(fp, key, nm, nm_len);
-    }
-  }
+  DrainOptimizedCount();
+  g_trace_writer->WriteFuncExit();  // pops call_stack_ top; no frame iterator needed
   return obj;  // must return TOS unchanged
 }
 
-// Shared helper: get SFI key, frame pointer, and (if needed) name from the top JS frame.
-namespace {
-bool GetTopFrameSFI(Isolate* isolate,
-                    const void** key_out,
-                    uintptr_t* fp_out,
-                    const char** nm_out,
-                    int* nm_len_out,
-                    std::unique_ptr<char[]>* storage) {
-  JavaScriptStackFrameIterator it(isolate);
-  if (it.done()) return false;
-  *fp_out = it.frame()->fp();
-  Tagged<JSFunction> func = it.frame()->function();
-  Tagged<SharedFunctionInfo> sfi = func->shared();
+// Helper: extract SFI key and (first-time) name from a JSGeneratorObject.
+// Used by TraceAsyncSuspend and TraceAsyncResume, which receive the generator
+// as args[0].
+static void GetSFIFromGenerator(Tagged<JSGeneratorObject> gen,
+                                const void** key_out,
+                                const char** nm_out,
+                                int* nm_len_out,
+                                std::unique_ptr<char[]>* storage) {
+  Tagged<SharedFunctionInfo> sfi = gen->function()->shared();
   *key_out = reinterpret_cast<const void*>(sfi.ptr());
   if (g_trace_writer && g_trace_writer->HasName(*key_out)) {
     *nm_out = nullptr; *nm_len_out = 0;
@@ -1857,21 +1843,19 @@ bool GetTopFrameSFI(Isolate* isolate,
     *nm_len_out = *nm_out ? static_cast<int>(strlen(*nm_out)) : 0;
     if (*nm_len_out == 0) { *nm_out = "(anonymous)"; *nm_len_out = 11; }
   }
-  return true;
 }
-}  // namespace
 
 RUNTIME_FUNCTION(Runtime_TraceAsyncSuspend) {
   SealHandleScope shs(isolate);
   CHECK_UNLESS_FUZZING(args.length() == 1);
   MaybeInitTraceWriter();
   if (g_trace_writer) {
-    const void* key; uintptr_t fp; const char* nm; int nm_len;
+    const void* key; const char* nm; int nm_len;
     std::unique_ptr<char[]> storage;
-    if (GetTopFrameSFI(isolate, &key, &fp, &nm, &nm_len, &storage)) {
-      DrainOptimizedCount();
-      g_trace_writer->WriteAsyncSuspend(fp, key, nm, nm_len);
-    }
+    GetSFIFromGenerator(Cast<JSGeneratorObject>(args[0]),
+                        &key, &nm, &nm_len, &storage);
+    DrainOptimizedCount();
+    g_trace_writer->WriteAsyncSuspend(key, nm, nm_len);
   }
   return ReadOnlyRoots(isolate).undefined_value();
 }
@@ -1881,12 +1865,12 @@ RUNTIME_FUNCTION(Runtime_TraceAsyncResume) {
   CHECK_UNLESS_FUZZING(args.length() == 1);
   MaybeInitTraceWriter();
   if (g_trace_writer) {
-    const void* key; uintptr_t fp; const char* nm; int nm_len;
+    const void* key; const char* nm; int nm_len;
     std::unique_ptr<char[]> storage;
-    if (GetTopFrameSFI(isolate, &key, &fp, &nm, &nm_len, &storage)) {
-      DrainOptimizedCount();
-      g_trace_writer->WriteAsyncResume(fp, key, nm, nm_len);
-    }
+    GetSFIFromGenerator(Cast<JSGeneratorObject>(args[0]),
+                        &key, &nm, &nm_len, &storage);
+    DrainOptimizedCount();
+    g_trace_writer->WriteAsyncResume(key, nm, nm_len);
   }
   return ReadOnlyRoots(isolate).undefined_value();
 }
