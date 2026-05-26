@@ -135,3 +135,20 @@ for lim in 1000 10000 100000 1000000; do
 done
 
 echo ""
+
+# ── Reference traces (default rate, single run) ────────────────────────────────
+
+echo "Generating reference traces (default rate)..."
+NODE_TRACE_FILE=./small_trace.bin $PATCHED -e "
+'use strict';
+function add(a, b) { return a + b; }
+function mul(a, b) { return a * b; }
+function compute(x) { return add(mul(x, 3), mul(x, 7)); }
+let acc = 0;
+for (let i = 0; i < 500; i++) acc = compute(acc & 0xff);
+" >/dev/null 2>&1
+NODE_TRACE_FILE=./large_trace.bin $PATCHED gen-large-trace.js >/dev/null 2>&1
+echo "  small_trace.bin  $(trace_stats ./small_trace.bin)"
+echo "  large_trace.bin  $(trace_stats ./large_trace.bin)"
+
+echo ""
