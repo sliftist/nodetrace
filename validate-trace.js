@@ -46,7 +46,7 @@ function readTrace(buf) {
       const func = names[u32()] ?? '(unknown)', callId = u32();
       events.push({ type: 'RESUME', ts, func, callId });
     } else if (type === EV_OPTIMIZED_BATCH) {
-      pos += 4;
+      pos += 20; // count(u32) + min_ts(u64) + max_ts(u64)
     } else if (type <= EV_ON_STACK_REPLACEMENT) {
       const func = names[u32()] ?? '(unknown)', callId = u32();
       const name = ['ENTER','EXIT','SUSPEND','RESUME','ON_STACK_REPLACEMENT'][type];

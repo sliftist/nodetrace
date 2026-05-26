@@ -58,7 +58,9 @@ function readTrace(buf) {
       events.push({ type: 'ENTER', ts, func, isAsync: !!isAsync, callId });
     } else if (type === EV_OPTIMIZED_BATCH) {
       const count = BigInt(u32());
-      events.push({ type: 'OPTIMIZED_BATCH', ts, count });
+      const minTs = u64();
+      const maxTs = u64();
+      events.push({ type: 'OPTIMIZED_BATCH', ts, count, minTs, maxTs });
     } else if (type <= EV_ON_STACK_REPLACEMENT) {
       const func   = readRef();
       const callId = u32();
