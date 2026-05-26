@@ -12,6 +12,7 @@
 
 #include "src/objects/function-kind.h"
 #include "src/trace/trace-writer.h"  // header-only, no separate .cc needed
+#include "src/trace/truetime.h"
 
 #include "include/v8-function.h"
 #include "include/v8-profiler.h"
@@ -1681,6 +1682,7 @@ namespace {
 // ── Binary trace writer (initialized once, used by TraceEnter/TraceExit) ──
 TraceWriter* g_trace_writer = nullptr;
 std::once_flag g_trace_init_flag;
+std::once_flag g_shim_flag;  // for setting globalThis.TRUE_TIME_ALREADY_SHIMMED
 
 // Opaque storage for uv_timer_t (152 bytes on Linux x64; 256 is safe).
 alignas(8) static char g_uv_timer_buf[256];
@@ -1743,6 +1745,8 @@ void MaybeInitTraceWriter() {
         // Enable the x64/arm64/... OSR-entry builtin to call
         // Runtime_LogOrTraceOptimizedOSREntry so we can emit FUNC_OSR events.
         v8_flags.log_or_trace_osr = true;
+        // Start NTP sync + open shared memory for cross-process time alignment.
+        nodetrace::InitTrueTime();
       }
     }
   });
@@ -1791,6 +1795,20 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
   // back to JavaScriptStackFrameIterator for those callers.
   MaybeInitTraceWriter();
   if (!g_trace_writer) return ReadOnlyRoots(isolate).undefined_value();
+
+  // Set globalThis.TRUE_TIME_ALREADY_SHIMMED = true on the first traced call
+  // so the trueTimeShim.ts skips replacing Date.now (we already replaced it).
+  std::call_once(g_shim_flag, [isolate]() {
+    HandleScope hs(isolate);
+    v8::Isolate* v8iso = reinterpret_cast<v8::Isolate*>(isolate);
+    v8::Local<v8::Context> ctx = v8iso->GetCurrentContext();
+    if (!ctx.IsEmpty()) {
+      v8::Local<v8::String> key = v8::String::NewFromUtf8Literal(
+          v8iso, "TRUE_TIME_ALREADY_SHIMMED");
+      ctx->Global()->Set(ctx, key, v8::True(v8iso)).IsJust();
+    }
+  });
+
   Tagged<SharedFunctionInfo> sfi;
   if (args.length() >= 1) {
     sfi = Cast<JSFunction>(args[0])->shared();

@@ -267,8 +267,8 @@ class TraceWriter {
     uint32_t call_id  = call_stack_.back().call_id;
     uint32_t name_idx = call_stack_.back().name_idx;
     call_stack_.pop_back();
-    stage_.push_back({.type = kTraceFuncOnStackReplacement, .ts = NowNs(),
-                      .name_idx = name_idx, .call_id = call_id});
+    stage_.push_back({.ts = NowNs(), .name_idx = name_idx, .call_id = call_id,
+                      .type = kTraceFuncOnStackReplacement});
   }
 
   void WriteOptimizedBatch(uint64_t count) {
