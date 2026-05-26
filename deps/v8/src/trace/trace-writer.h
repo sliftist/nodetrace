@@ -6,8 +6,6 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
-#include <unordered_map>
-#include <unordered_set>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
@@ -25,22 +23,26 @@
 //   [fields] fixed layout determined by type — no per-field tags
 //
 // EVENT TYPES (type field, bottom 6 bits of header):
+//
+//   START events — each has a matching END identified by call_id:
 //   0x00  FUNC_ENTER    name_idx(u32-LE), is_async(u8), call_id(u32-LE)
+//   0x03  ASYNC_RESUME  name_idx(u32-LE), call_id(u32-LE)
+//
+//   END events — matched to their START by call_id:
 //   0x01  FUNC_EXIT     name_idx(u32-LE), call_id(u32-LE)
 //   0x02  ASYNC_SUSPEND name_idx(u32-LE), call_id(u32-LE)
-//   0x03  ASYNC_RESUME  name_idx(u32-LE), call_id(u32-LE)
 //   0x04  FUNC_ON_STACK_REPLACEMENT  name_idx(u32-LE), call_id(u32-LE)
+//
+//   Bookkeeping — no call_id, no stack effect:
 //   0x05  OPTIMIZED_BATCH  count(u32-LE)
-//            ts in header = ts_end of the JIT window
-//            ts_start is implicitly the previous record's timestamp
+//            count calls that were not individually recorded: either JIT-compiled
+//            (TurboFan/Maglev/Sparkplug stripped the trace hooks) or dropped by
+//            the INSPECT_MAX_PER_SECOND throttle.  Emitted immediately before the
+//            next kept event; ts = that next event's timestamp.
 //   0x06  NEW_NAME      name_idx(u32-LE), len(u16-LE), utf-8 bytes
 //            Assigns a permanent index to a function name.  Always emitted
 //            before the first call event that references that name_idx.
 //            The following call event has delta=0 (same timestamp).
-//   0x07  EXCLUDED_BATCH  count(u32-LE)
-//            count calls (ENTER+EXIT counted as 1) that were dropped by the
-//            INSPECT_MAX_PER_SECOND throttle.  Emitted immediately before the
-//            next kept event; ts = that next event's timestamp.
 //
 // name_idx is assigned in order of first appearance (0, 1, 2, ...).
 // The reader maintains a flat array: names[name_idx] = string.
@@ -53,18 +55,19 @@
 // call_id is a process-global u32 counter incremented on every ENTER and RESUME.
 //
 // Throttling (INSPECT_MAX_PER_SECOND, default 100 000):
-//   Events are staged for up to 100 ms, then filtered.  Calls shorter than a
-//   computed duration threshold are dropped and counted into EXCLUDED_BATCH.
+//   Events are staged until a libuv timer fires (every ~100 ms), then filtered.
+//   Calls shorter than a computed duration threshold are dropped and folded into
+//   OPTIMIZED_BATCH along with any JIT-compiled calls.
 //   The threshold is derived by exponential-bucket histogram so that the
-//   surviving call count ≈ max_per_second × 0.1 per 100 ms window.
+//   surviving call count ≈ max_per_second × elapsed_seconds per flush window.
 //   A synthetic FUNC_ENTER / FUNC_EXIT pair named "(trace-flush)" wraps each
 //   flush period, showing exactly how long the filter pass took.
 //
 // Approximate record sizes (delta fits in 1 byte — typical between events):
-//   NEW_NAME (len N):                  1 + 1 + 4 + 2 + N = 8+N bytes
-//   ENTER:                             1 + 1 + 4 + 1 + 4 = 11 bytes
+//   NEW_NAME (len N):                     1 + 1 + 4 + 2 + N = 8+N bytes
+//   ENTER:                                1 + 1 + 4 + 1 + 4 = 11 bytes
 //   EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT: 1 + 1 + 4 + 4 = 10 bytes
-//   OPTIMIZED_BATCH / EXCLUDED_BATCH:  1 + 1 + 4 = 6 bytes
+//   OPTIMIZED_BATCH:                      1 + 1 + 4 = 6 bytes
 
 namespace v8 {
 namespace internal {
@@ -73,14 +76,16 @@ static constexpr size_t kTraceChunkSize = 128ULL * 1024 * 1024;
 static constexpr size_t kMaxTraceRecord = 512;
 
 enum TraceEventType : uint8_t {
+  // START events (matched to END by call_id):
   kTraceFuncEnter              = 0x00,
+  kTraceAsyncResume            = 0x03,
+  // END events (matched to START by call_id):
   kTraceFuncExit               = 0x01,
   kTraceAsyncSuspend           = 0x02,
-  kTraceAsyncResume            = 0x03,
   kTraceFuncOnStackReplacement = 0x04,
+  // Bookkeeping (no call_id):
   kTraceOptimizedBatch         = 0x05,
   kTraceNewName                = 0x06,
-  kTraceExcludedBatch          = 0x07,
 };
 
 // ── SFI pointer → name index hash table ──────────────────────────────────────
@@ -155,14 +160,17 @@ class TraceWriter {
  public:
   TraceWriter()
       : buf_(nullptr), ptr_(nullptr), buf_end_(nullptr), fd_(-1),
-        next_call_id_(0), last_event_ts_(0), max_per_second_(100000) {}
+        next_call_id_(0), last_event_ts_(0), max_per_second_(100000),
+        last_flush_ts_(0) {}
 
   ~TraceWriter() {
-    ForceCloseAbove(-1);  // push any remaining open frames to stage_
-    FlushStageAll();       // emit all staged events to binary buffer without filtering
+    ForceCloseAbove(-1);
+    FlushStage();
     FlushBuffer();
     if (fd_ >= 0) { close(fd_); fd_ = -1; }
-    if (buf_)     { free(buf_); buf_ = nullptr; }
+    if (buf_)       { free(buf_);       buf_       = nullptr; }
+    if (flush_stk_) { free(flush_stk_); flush_stk_ = nullptr; }
+    if (keep_bm_)   { free(keep_bm_);   keep_bm_   = nullptr; }
   }
 
   bool Initialize(const char* output_path) {
@@ -295,125 +303,157 @@ class TraceWriter {
   // ── Stage flush — called by the 100ms libuv timer ──────────────────────────
 
   // Filter staged events to meet INSPECT_MAX_PER_SECOND, then emit to buf_.
+  // Three passes:
+  //   1. Stack-based matching → exponential histogram → min_duration threshold
+  //   2. Stack-based matching → compact keep bitmap (1 byte per call_id slot)
+  //   3. Emit: kept events pass through; excluded calls + OPTIMIZED_BATCH events
+  //      fold into a single pending count emitted as OPTIMIZED_BATCH before the
+  //      next kept event.
   __attribute__((noinline)) void FlushStage() {
     if (stage_.empty()) return;
 
-    // Count call starts (ENTER + RESUME) in this window.
+    // Count starts; find call_id range for keep bitmap.
     uint32_t start_count = 0;
+    uint32_t min_id = UINT32_MAX, max_id = 0;
     for (const auto& e : stage_) {
-      if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) start_count++;
+      if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
+        ++start_count;
+        if (e.call_id < min_id) min_id = e.call_id;
+        if (e.call_id > max_id) max_id = e.call_id;
+      }
     }
 
-    // target = calls allowed in a 100ms window
+    uint64_t window_start = last_flush_ts_ ? last_flush_ts_ : stage_.front().ts;
+    uint64_t window_ns    = stage_.back().ts - window_start;
+    if (window_ns == 0) window_ns = 1;
     uint32_t target = static_cast<uint32_t>(
-        static_cast<uint64_t>(max_per_second_) * 100 / 1000);
+        static_cast<uint64_t>(max_per_second_) * window_ns / 1000000000ULL);
 
-    if (start_count <= target) {
+    if (start_count <= target || start_count == 0) {
       FlushStageAll();
       return;
     }
 
-    // ── Pass 1: build exponential duration histogram ─────────────────────────
+    // ── Pass 1: exponential histogram ───────────────────────────────────────
     // Bucket b covers durations in [2^b, 2^(b+1)) ns; bucket 0 covers [0, 2).
-    std::unordered_map<uint32_t, uint64_t> open_ts;
-    open_ts.reserve(start_count);
+    FlushStkReset();
     uint32_t histogram[64] = {};
 
     for (const auto& e : stage_) {
       if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
-        open_ts[e.call_id] = e.ts;
+        FlushStkPush(e.call_id, e.ts);
       } else if (e.type == kTraceFuncExit || e.type == kTraceAsyncSuspend ||
                  e.type == kTraceFuncOnStackReplacement) {
-        auto it = open_ts.find(e.call_id);
-        if (it != open_ts.end()) {
-          uint64_t dur = e.ts - it->second;
-          int b = (dur == 0) ? 0 : (63 - __builtin_clzll(dur));
-          histogram[b]++;
-          open_ts.erase(it);
+        int idx = FlushStkFind(e.call_id);
+        if (idx >= 0) {
+          uint64_t dur = e.ts - flush_stk_[idx].ts;
+          histogram[(dur == 0) ? 0 : (63 - __builtin_clzll(dur))]++;
+          flush_stk_top_ = idx;  // pop match + everything above
         }
       }
     }
 
-    // ── Compute minimum duration threshold via interpolation ─────────────────
-    // Walk buckets from longest to shortest; find where cumulative kept count
-    // would hit `target`.  Interpolate linearly within the straddling bucket.
+    // ── Compute threshold via interpolation ──────────────────────────────────
+    // Walk from longest bucket down; interpolate within the straddling bucket
+    // so that kept_count ≈ target.
     uint64_t min_duration = [&]() -> uint64_t {
       uint32_t cum = 0;
       for (int b = 63; b >= 0; b--) {
-        if (cum + histogram[b] <= target) {
-          cum += histogram[b];
-          continue;
-        }
+        if (cum + histogram[b] <= target) { cum += histogram[b]; continue; }
         uint32_t needed = target - cum;
         uint64_t bmin = (b == 0) ? 0ULL : (1ULL << b);
         uint64_t bmax = (b >= 63) ? UINT64_MAX : (2ULL << b);
-        uint64_t span = bmax - bmin;
+        uint64_t span  = bmax - bmin;
         if (needed == 0 || histogram[b] == 0) return bmax;
-        // Keep the `needed` longest calls in this bucket.
-        // Assuming uniform distribution: threshold = bmax - span*needed/count
         return bmin + span * (uint64_t)(histogram[b] - needed) / histogram[b];
       }
-      return 0;  // everything fits (shouldn't reach here since start_count > target)
+      return 0;
     }();
 
-    // ── Build keep_ids: call_ids whose duration meets the threshold ───────────
-    open_ts.clear();
+    // ── Allocate/grow keep bitmap ────────────────────────────────────────────
+    // One byte per call_id slot in [min_id, max_id].  Preserved across flushes
+    // up to 16 MB; larger windows use a temporary allocation.
+    uint32_t id_span = max_id - min_id + 1;
+    static constexpr uint32_t kMaxPersistBm = 16u * 1024 * 1024;
+    uint8_t* bm;
+    bool bm_is_temp = false;
+    if (id_span <= kMaxPersistBm) {
+      if (id_span > keep_bm_cap_) {
+        keep_bm_     = static_cast<uint8_t*>(realloc(keep_bm_, id_span));
+        keep_bm_cap_ = id_span;
+      }
+      bm = keep_bm_;
+    } else {
+      bm = static_cast<uint8_t*>(malloc(id_span));
+      bm_is_temp = true;
+    }
+    memset(bm, 0, id_span);
+
+    // ── Pass 2: populate keep bitmap ─────────────────────────────────────────
+    FlushStkReset();
     for (const auto& e : stage_) {
       if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
-        open_ts[e.call_id] = e.ts;
-      }
-    }
-
-    std::unordered_set<uint32_t> keep_ids;
-    keep_ids.reserve(target);
-    for (const auto& e : stage_) {
-      if (e.type == kTraceFuncExit || e.type == kTraceAsyncSuspend ||
-          e.type == kTraceFuncOnStackReplacement) {
-        auto it = open_ts.find(e.call_id);
-        if (it == open_ts.end()) {
-          keep_ids.insert(e.call_id);  // cross-boundary: always keep
-        } else if (e.ts - it->second >= min_duration) {
-          keep_ids.insert(e.call_id);
+        FlushStkPush(e.call_id, e.ts);
+      } else if (e.type == kTraceFuncExit || e.type == kTraceAsyncSuspend ||
+                 e.type == kTraceFuncOnStackReplacement) {
+        int idx = FlushStkFind(e.call_id);
+        if (idx < 0) {
+          // Cross-boundary exit (no matching enter in this window): always keep.
+          if (e.call_id >= min_id && e.call_id <= max_id)
+            bm[e.call_id - min_id] = 1;
+        } else {
+          // Entries above idx were interrupted by this exit: always keep them.
+          for (int i = idx + 1; i < flush_stk_top_; i++)
+            bm[flush_stk_[i].call_id - min_id] = 1;
+          uint64_t dur = e.ts - flush_stk_[idx].ts;
+          bm[e.call_id - min_id] = (dur >= min_duration) ? 1 : 0;
+          flush_stk_top_ = idx;  // pop match + everything above
         }
       }
     }
+    // Open at end of window = cross-boundary enters: keep.
+    for (int i = 0; i < flush_stk_top_; i++)
+      bm[flush_stk_[i].call_id - min_id] = 1;
 
-    // ── Pass 2: emit filtered events with EXCLUDED_BATCH for gaps ────────────
-    uint32_t excl = 0;
+    // ── Pass 3: emit, folding excluded + batch counts into OPTIMIZED_BATCH ───
+    uint32_t pending = 0;
+    auto emit_pending = [&](uint64_t ts) __attribute__((always_inline)) {
+      if (!pending) return;
+      EnsureSpace();
+      WriteHeader(kTraceOptimizedBatch, ts);
+      W4(pending);
+      pending = 0;
+    };
 
     for (const auto& e : stage_) {
       if (e.type == kTraceNewName) {
-        if (excl > 0) { EmitExcludedBatch(e.ts, excl); excl = 0; }
+        emit_pending(e.ts);
         EmitStagedToBuf(e);
       } else if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
-        if (keep_ids.count(e.call_id)) {
-          if (excl > 0) { EmitExcludedBatch(e.ts, excl); excl = 0; }
-          EmitStagedToBuf(e);
-        } else {
-          excl++;
-        }
+        bool keep = (e.call_id < min_id || e.call_id > max_id)
+                    || bm[e.call_id - min_id];
+        if (keep) { emit_pending(e.ts); EmitStagedToBuf(e); }
+        else       pending++;
       } else if (e.type == kTraceFuncExit || e.type == kTraceAsyncSuspend ||
                  e.type == kTraceFuncOnStackReplacement) {
-        if (keep_ids.count(e.call_id)) {
-          if (excl > 0) { EmitExcludedBatch(e.ts, excl); excl = 0; }
-          EmitStagedToBuf(e);
-        }
-        // excluded ends are silently dropped (counted at ENTER time)
+        bool keep = (e.call_id < min_id || e.call_id > max_id)
+                    || bm[e.call_id - min_id];
+        if (keep) { emit_pending(e.ts); EmitStagedToBuf(e); }
+        // excluded ends silently dropped
       } else if (e.type == kTraceOptimizedBatch) {
-        if (excl > 0) { EmitExcludedBatch(e.ts, excl); excl = 0; }
-        EmitStagedToBuf(e);
+        pending += e.batch_count;
       }
     }
+    if (pending) emit_pending(stage_.back().ts);
 
-    if (excl > 0 && !stage_.empty()) {
-      EmitExcludedBatch(stage_.back().ts, excl);
-    }
-
+    if (bm_is_temp) free(bm);
+    if (!stage_.empty()) last_flush_ts_ = stage_.back().ts;
     stage_.clear();
   }
 
   // Emit all staged events without filtering (shutdown / forced drain).
   __attribute__((noinline)) void FlushStageAll() {
+    if (!stage_.empty()) last_flush_ts_ = stage_.back().ts;
     for (const auto& ev : stage_) EmitStagedToBuf(ev);
     stage_.clear();
   }
@@ -502,6 +542,34 @@ class TraceWriter {
   // ── Call ID, call stack, staged events ───────────────────────────────────────
   uint32_t next_call_id_;
   uint32_t max_per_second_;
+  uint64_t last_flush_ts_;
+
+  // ── Flush-pass stack (preserved across flushes to avoid repeated malloc) ────
+  struct FlushStkE { uint32_t call_id; uint64_t ts; };
+  FlushStkE* flush_stk_     = nullptr;
+  int        flush_stk_top_ = 0;
+  int        flush_stk_cap_ = 0;
+
+  void FlushStkReset() { flush_stk_top_ = 0; }
+
+  void FlushStkPush(uint32_t id, uint64_t ts) {
+    if (flush_stk_top_ == flush_stk_cap_) {
+      flush_stk_cap_ = flush_stk_cap_ ? flush_stk_cap_ * 2 : 64;
+      flush_stk_ = static_cast<FlushStkE*>(
+          realloc(flush_stk_, flush_stk_cap_ * sizeof(FlushStkE)));
+    }
+    flush_stk_[flush_stk_top_++] = {id, ts};
+  }
+
+  int FlushStkFind(uint32_t id) const {
+    for (int i = flush_stk_top_ - 1; i >= 0; i--)
+      if (flush_stk_[i].call_id == id) return i;
+    return -1;
+  }
+
+  // ── Keep bitmap (preserved across flushes up to 16 MB) ──────────────────────
+  uint8_t* keep_bm_     = nullptr;
+  uint32_t keep_bm_cap_ = 0;
 
   struct StackFrame {
     uint32_t    call_id;
@@ -571,18 +639,10 @@ class TraceWriter {
         W4(ev.name_idx); W4(ev.call_id);
         break;
       case kTraceOptimizedBatch:
-      case kTraceExcludedBatch:
-        WriteHeader(ev.type, ev.ts);
+        WriteHeader(kTraceOptimizedBatch, ev.ts);
         W4(ev.batch_count);
         break;
     }
-  }
-
-  // Emit an EXCLUDED_BATCH record directly to the binary buffer.
-  __attribute__((always_inline)) inline void EmitExcludedBatch(uint64_t ts, uint32_t count) {
-    EnsureSpace();
-    WriteHeader(kTraceExcludedBatch, ts);
-    W4(count);
   }
 
   // ── Stack helpers ────────────────────────────────────────────────────────────

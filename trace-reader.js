@@ -12,9 +12,10 @@ const EV_RESUME   = 0x03;
 const EV_ON_STACK_REPLACEMENT = 0x04;
 const EV_OPTIMIZED_BATCH = 0x05;
 const EV_NEWNAME  = 0x06;
-const EV_EXCLUDED_BATCH = 0x07;
 
-const EV_NAME = ['ENTER', 'EXIT', 'SUSPEND', 'RESUME', 'ON_STACK_REPLACEMENT', 'OPTIMIZED_BATCH', 'NEW_NAME', 'EXCLUDED_BATCH'];
+// 0x05 OPTIMIZED_BATCH covers both JIT-compiled calls (TurboFan/Maglev/Sparkplug)
+// and calls dropped by the INSPECT_MAX_PER_SECOND throttle.
+const EV_NAME = ['ENTER', 'EXIT', 'SUSPEND', 'RESUME', 'ON_STACK_REPLACEMENT', 'OPTIMIZED_BATCH', 'NEW_NAME'];
 
 // ── Binary reader ──────────────────────────────────────────────────────────────
 // Format: flat stream of records, no per-field tags.
@@ -80,9 +81,6 @@ function readTrace(buf) {
     } else if (type === EV_OPTIMIZED_BATCH) {
       const count = BigInt(u32());
       events.push({ type: 'OPTIMIZED_BATCH', ts, count });
-    } else if (type === EV_EXCLUDED_BATCH) {
-      const count = u32();
-      events.push({ type: 'EXCLUDED_BATCH', ts, count });
     } else if (type <= EV_ON_STACK_REPLACEMENT) {
       const func   = readRef();
       const callId = u32();
@@ -104,7 +102,6 @@ function summarize(events) {
   const osrCount  = Object.create(null);
   const stack = [];
   let turboFanTotal = 0n;
-  let excludedTotal = 0;
 
   for (const ev of events) {
     counts[ev.type] = (counts[ev.type] ?? 0) + 1;
@@ -123,12 +120,10 @@ function summarize(events) {
       osrCount[ev.func] = (osrCount[ev.func] ?? 0) + 1;
     } else if (ev.type === 'OPTIMIZED_BATCH') {
       turboFanTotal += ev.count;
-    } else if (ev.type === 'EXCLUDED_BATCH') {
-      excludedTotal += ev.count;
     }
   }
 
-  return { counts, wallNs, callCount, osrCount, turboFanTotal, excludedTotal };
+  return { counts, wallNs, callCount, osrCount, turboFanTotal };
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
@@ -145,7 +140,7 @@ console.log(`Read ${buf.length.toLocaleString()} bytes from ${path}`);
 const { events, uniqueNames, newNameEvents } = readTrace(buf);
 console.log(`Decoded ${events.length.toLocaleString()} events\n`);
 
-const { counts, wallNs, callCount, osrCount, turboFanTotal, excludedTotal } = summarize(events);
+const { counts, wallNs, callCount, osrCount, turboFanTotal } = summarize(events);
 
 const ignitionTotal = counts['ENTER'] ?? 0;
 console.log('Event type breakdown:');
@@ -156,7 +151,6 @@ console.log(`  ${'NEW_NAME (emitted)'.padEnd(25)} ${newNameEvents.toLocaleString
 console.log(`  ${'Unique function names'.padEnd(25)} ${uniqueNames.toLocaleString()}`);
 console.log(`\n  Ignition calls (ENTER):    ${ignitionTotal.toLocaleString()}`);
 console.log(`  Optimized calls (batched): ${turboFanTotal.toLocaleString()}`);
-if (excludedTotal > 0) console.log(`  Excluded by throttle:      ${excludedTotal.toLocaleString()}`);
 console.log(`  Total accounted calls:    ${(BigInt(ignitionTotal) + turboFanTotal).toLocaleString()}`);
 
 const top = Object.entries(wallNs)

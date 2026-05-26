@@ -1,4 +1,4 @@
-Max call stack depth: 37
+Max call stack depth: 35
 
 Stack at max depth (bottom → top):
   [0] callId=0  (anonymous)
@@ -36,5 +36,3 @@ Stack at max depth (bottom → top):
   [32] callId=1328  requireBuiltin
   [33] callId=1329  compileForInternalLoader
   [34] callId=1330  (anonymous)
-  [35] callId=1331  requireBuiltin
-  [36] callId=1332  compileForInternalLoader
