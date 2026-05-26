@@ -1758,13 +1758,17 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
     Tagged<JSFunction> func = it.frame()->function();
     Tagged<SharedFunctionInfo> sfi = func->shared();
     const void* key = reinterpret_cast<const void*>(sfi.ptr());
-    std::unique_ptr<char[]> name = sfi->DebugNameCStr();
-    const char* nm = name.get();
-    int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
-    if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
     bool is_async = IsAsyncFunction(sfi->kind());
     DrainOptimizedCount();
-    g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async);
+    if (g_trace_writer->HasName(key)) {
+      g_trace_writer->WriteFuncEnter(key, nullptr, 0, is_async);
+    } else {
+      std::unique_ptr<char[]> name = sfi->DebugNameCStr();
+      const char* nm = name.get();
+      int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
+      if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
+      g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async);
+    }
   }
   return ReadOnlyRoots(isolate).undefined_value();
 }
@@ -1780,17 +1784,21 @@ RUNTIME_FUNCTION(Runtime_TraceExit) {
     Tagged<JSFunction> func = it.frame()->function();
     Tagged<SharedFunctionInfo> sfi = func->shared();
     const void* key = reinterpret_cast<const void*>(sfi.ptr());
-    std::unique_ptr<char[]> name = sfi->DebugNameCStr();
-    const char* nm = name.get();
-    int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
-    if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
     DrainOptimizedCount();
-    g_trace_writer->WriteFuncExit(key, nm, nm_len);
+    if (g_trace_writer->HasName(key)) {
+      g_trace_writer->WriteFuncExit(key, nullptr, 0);
+    } else {
+      std::unique_ptr<char[]> name = sfi->DebugNameCStr();
+      const char* nm = name.get();
+      int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
+      if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
+      g_trace_writer->WriteFuncExit(key, nm, nm_len);
+    }
   }
   return obj;  // must return TOS unchanged
 }
 
-// Shared helper: get SFI info from the top JS frame.
+// Shared helper: get SFI key and (if needed) name from the top JS frame.
 namespace {
 bool GetTopFrameSFI(Isolate* isolate,
                     const void** key_out,
@@ -1802,10 +1810,14 @@ bool GetTopFrameSFI(Isolate* isolate,
   Tagged<JSFunction> func = it.frame()->function();
   Tagged<SharedFunctionInfo> sfi = func->shared();
   *key_out = reinterpret_cast<const void*>(sfi.ptr());
-  *storage = sfi->DebugNameCStr();
-  *nm_out  = storage->get();
-  *nm_len_out = *nm_out ? static_cast<int>(strlen(*nm_out)) : 0;
-  if (*nm_len_out == 0) { *nm_out = "(anonymous)"; *nm_len_out = 11; }
+  if (g_trace_writer && g_trace_writer->HasName(*key_out)) {
+    *nm_out = nullptr; *nm_len_out = 0;
+  } else {
+    *storage = sfi->DebugNameCStr();
+    *nm_out  = storage->get();
+    *nm_len_out = *nm_out ? static_cast<int>(strlen(*nm_out)) : 0;
+    if (*nm_len_out == 0) { *nm_out = "(anonymous)"; *nm_len_out = 11; }
+  }
   return true;
 }
 }  // namespace

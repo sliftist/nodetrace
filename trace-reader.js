@@ -21,21 +21,17 @@ const EV_NAME = ['ENTER', 'EXIT', 'SUSPEND', 'RESUME', 'ON_STACK_REPLACEMENT', '
 //     ss=0 → 1-byte delta, ss=1 → 2-byte, ss=2 → 4-byte, ss=3 → 8-byte
 //   Delta timestamp (LE, ss bytes) added to running absolute timestamp
 //   Fixed fields per type (no tags):
-//     NEW_NAME: u16 len + utf-8 bytes  (pushes name to ring cache)
-//     ENTER:    cache_ref(u8), is_async(u8), call_id(u32)
-//     EXIT:     cache_ref(u8), call_id(u32)
-//     SUSPEND:  cache_ref(u8), call_id(u32)
-//     RESUME:   cache_ref(u8), call_id(u32)
-//     ON_STACK_REPLACEMENT: cache_ref(u8), call_id(u32)
+//     NEW_NAME: name_idx(u32), len(u16), utf-8 bytes
+//     ENTER:    name_idx(u32), is_async(u8), call_id(u32)
+//     EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT: name_idx(u32), call_id(u32)
 //     OPTIMIZED_BATCH: count(u32)
-//   cache_ref is always 1-128; NEW_NAME is emitted before first use of a name.
+//   name_idx is permanent; reader keeps a flat array names[idx]=string.
 
 function readTrace(buf) {
   let pos = 0;
-  const nameCache = [];
+  const names = [];   // names[idx] = string
   const events = [];
   let lastTs = 0n;
-  const uniqueNames = new Set();
   let newNameEvents = 0;
 
   const u8  = () => buf[pos++];
@@ -57,7 +53,7 @@ function readTrace(buf) {
     }
   };
 
-  const readRef = () => nameCache[u8() - 1] ?? '(unknown)';
+  const readRef = () => names[u32()] ?? '(unknown)';
 
   while (pos < buf.length) {
     const header = u8();
@@ -69,12 +65,11 @@ function readTrace(buf) {
     const ts = lastTs;
 
     if (type === EV_NEWNAME) {
+      const idx  = u32();
       const len  = u16();
       const name = buf.toString('utf8', pos, pos + len);
       pos += len;
-      nameCache.unshift(name);
-      if (nameCache.length > 128) nameCache.pop();
-      uniqueNames.add(name);
+      names[idx] = name;
       newNameEvents++;
     } else if (type === EV_ENTER) {
       const func    = readRef();
@@ -93,7 +88,7 @@ function readTrace(buf) {
     }
   }
 
-  return { events, uniqueNames: uniqueNames.size, newNameEvents };
+  return { events, uniqueNames: names.length, newNameEvents };
 }
 
 // ── Analysis ───────────────────────────────────────────────────────────────────

@@ -11,7 +11,7 @@ const EV_NEWNAME  = 0x06;
 
 function readTrace(buf) {
   let pos = 0;
-  const nameCache = [];
+  const names = [];
   const events = [];
   let lastTs = 0n;
 
@@ -34,7 +34,7 @@ function readTrace(buf) {
     }
   };
 
-  const readRef = () => nameCache[u8() - 1] ?? '(unknown)';
+  const readRef = () => names[u32()] ?? '(unknown)';
 
   while (pos < buf.length) {
     const header = u8();
@@ -46,11 +46,11 @@ function readTrace(buf) {
     const ts = lastTs;
 
     if (type === EV_NEWNAME) {
+      const idx  = u32();
       const len  = u16();
       const name = buf.toString('utf8', pos, pos + len);
       pos += len;
-      nameCache.unshift(name);
-      if (nameCache.length > 128) nameCache.pop();
+      names[idx] = name;
     } else if (type === EV_ENTER) {
       const func    = readRef();
       const isAsync = u8();

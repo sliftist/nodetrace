@@ -22,62 +22,121 @@
 //            absolute ts = running sum of all deltas since t=0
 //   [fields] fixed layout determined by type — no per-field tags
 //
-// FUNCTION NAME FIELD (used in ENTER/EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT):
-//   [uint8]  prefix
-//     0       → new name: [uint16-LE len][utf-8 bytes], pushed to ring cache
-//     1..128  → cache ref: distance into ring (1 = most recently seen)
-//
 // EVENT TYPES (type field, bottom 6 bits of header):
-//   0x00  FUNC_ENTER    cache_ref(u8), is_async(u8), call_id(u32-LE)
-//   0x01  FUNC_EXIT     cache_ref(u8), call_id(u32-LE)
-//   0x02  ASYNC_SUSPEND cache_ref(u8), call_id(u32-LE)
-//   0x03  ASYNC_RESUME  cache_ref(u8), call_id(u32-LE)
-//   0x04  FUNC_ON_STACK_REPLACEMENT  cache_ref(u8), call_id(u32-LE)
+//   0x00  FUNC_ENTER    name_idx(u32-LE), is_async(u8), call_id(u32-LE)
+//   0x01  FUNC_EXIT     name_idx(u32-LE), call_id(u32-LE)
+//   0x02  ASYNC_SUSPEND name_idx(u32-LE), call_id(u32-LE)
+//   0x03  ASYNC_RESUME  name_idx(u32-LE), call_id(u32-LE)
+//   0x04  FUNC_ON_STACK_REPLACEMENT  name_idx(u32-LE), call_id(u32-LE)
 //   0x05  OPTIMIZED_BATCH  count(u32-LE)
 //            ts in header = ts_end of the JIT window
 //            ts_start is implicitly the previous record's timestamp
-//   0x06  NEW_NAME      len(u16-LE), utf-8 bytes
-//            Pushes a new name onto the ring cache.  Always emitted
-//            immediately before the first call event that uses it,
-//            with the same timestamp (delta = 0 on the following record).
+//   0x06  NEW_NAME      name_idx(u32-LE), len(u16-LE), utf-8 bytes
+//            Assigns a permanent index to a function name.  Always emitted
+//            before the first call event that references that name_idx.
+//            The following call event has delta=0 (same timestamp).
 //
-// cache_ref is always 1-128 (1 = most-recently-pushed name).
-// NEW_NAME is emitted automatically; readers never see cache_ref = 0.
+// name_idx is assigned in order of first appearance (0, 1, 2, ...).
+// The reader maintains a flat array: names[name_idx] = string.
 //
 // call_id is a process-global u32 counter incremented on every ENTER.
 // SUSPEND/RESUME/EXIT carry the same call_id as their matching ENTER.
 //
 // Approximate record sizes (delta fits in 1 byte — typical between events):
-//   NEW_NAME (len N):       1 + 1 + 2 + N = 4+N bytes
-//   ENTER:                  1 + 1 + 1 + 1 + 4 = 8 bytes  (delta=0 if name was new)
-//   EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT: 1 + 1 + 1 + 4 = 7 bytes
-//   OPTIMIZED_BATCH:        1 + 1 + 4 = 6 bytes
+//   NEW_NAME (len N):                  1 + 1 + 4 + 2 + N = 8+N bytes
+//   ENTER:                             1 + 1 + 4 + 1 + 4 = 11 bytes
+//   EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT: 1 + 1 + 4 + 4 = 10 bytes
+//   OPTIMIZED_BATCH:                   1 + 1 + 4 = 6 bytes
 
 namespace v8 {
 namespace internal {
 
 static constexpr size_t kTraceChunkSize = 128ULL * 1024 * 1024;
 static constexpr size_t kMaxTraceRecord = 512;
-static constexpr int    kTraceCacheSize = 128;
 
 enum TraceEventType : uint8_t {
-  kTraceFuncEnter     = 0x00,
-  kTraceFuncExit      = 0x01,
-  kTraceAsyncSuspend  = 0x02,
-  kTraceAsyncResume   = 0x03,
+  kTraceFuncEnter              = 0x00,
+  kTraceFuncExit               = 0x01,
+  kTraceAsyncSuspend           = 0x02,
+  kTraceAsyncResume            = 0x03,
   kTraceFuncOnStackReplacement = 0x04,
-  kTraceOptimizedBatch = 0x05,
-  kTraceNewName       = 0x06,
+  kTraceOptimizedBatch         = 0x05,
+  kTraceNewName                = 0x06,
+};
+
+// ── SFI pointer → name index hash table ──────────────────────────────────────
+// Open addressing, linear probing.  Load factor capped at 1/4.
+// Starts at 16 slots, grows ×4 on overflow.
+class SfiNameTable {
+ public:
+  struct Slot { const void* ptr; uint32_t idx; };
+
+  SfiNameTable() : slots_(nullptr), capacity_(0), count_(0), next_idx_(0) {
+    Resize(16);
+  }
+  ~SfiNameTable() { free(slots_); }
+
+  // Returns the existing index for ptr, or assigns next_idx_ and returns that.
+  // Sets *is_new=true when a fresh index was assigned.
+  __attribute__((always_inline)) inline uint32_t Upsert(const void* ptr, bool* is_new) {
+    if (__builtin_expect(count_ > (capacity_ >> 2), 0)) Resize(capacity_ << 2);
+    uint32_t h = Hash(ptr), i = 0;
+    for (;;) {
+      uint32_t s = (h + i++) & (capacity_ - 1);
+      if (!slots_[s].ptr) {
+        slots_[s] = {ptr, next_idx_};
+        count_++;
+        *is_new = true;
+        return next_idx_++;
+      }
+      if (slots_[s].ptr == ptr) { *is_new = false; return slots_[s].idx; }
+    }
+  }
+
+  __attribute__((always_inline)) inline bool Has(const void* ptr) const {
+    uint32_t h = Hash(ptr), i = 0;
+    for (;;) {
+      uint32_t s = (h + i++) & (capacity_ - 1);
+      if (!slots_[s].ptr) return false;
+      if (slots_[s].ptr == ptr) return true;
+    }
+  }
+
+ private:
+  Slot*    slots_;
+  uint32_t capacity_;
+  uint32_t count_;
+  uint32_t next_idx_;
+
+  static __attribute__((always_inline)) inline uint32_t Hash(const void* ptr) {
+    uintptr_t h = reinterpret_cast<uintptr_t>(ptr) >> 3;
+    h ^= h >> 16;
+    h *= 0x45d9f3bu;
+    h ^= h >> 16;
+    return static_cast<uint32_t>(h);
+  }
+
+  __attribute__((noinline)) void Resize(uint32_t new_cap) {
+    Slot* ns = static_cast<Slot*>(calloc(new_cap, sizeof(Slot)));
+    for (uint32_t i = 0; i < capacity_; i++) {
+      if (!slots_[i].ptr) continue;
+      uint32_t h = Hash(slots_[i].ptr), j = 0;
+      for (;;) {
+        uint32_t s = (h + j++) & (new_cap - 1);
+        if (!ns[s].ptr) { ns[s] = slots_[i]; break; }
+      }
+    }
+    free(slots_);
+    slots_ = ns;
+    capacity_ = new_cap;
+  }
 };
 
 class TraceWriter {
  public:
   TraceWriter()
       : buf_(nullptr), ptr_(nullptr), buf_end_(nullptr), fd_(-1),
-        next_call_id_(0), cache_head_(0), cache_count_(0),
-        last_event_ts_(0) {
-    memset(cache_, 0, sizeof(cache_));
-  }
+        next_call_id_(0), last_event_ts_(0) {}
 
   ~TraceWriter() {
     Flush();
@@ -96,15 +155,21 @@ class TraceWriter {
     return true;
   }
 
+  // Returns true if this SFI pointer has already been assigned a name index.
+  // The caller can use this to skip the expensive DebugNameCStr() call.
+  __attribute__((always_inline)) inline bool HasName(const void* sfi_key) const {
+    return name_table_.Has(sfi_key);
+  }
+
   __attribute__((always_inline)) inline void WriteFuncEnter(
       const void* sfi_key, const char* name, int name_len, bool is_async) {
     EnsureSpace();
     uint32_t call_id = next_call_id_++;
     call_stack_.push_back(call_id);
     uint64_t ts = NowNs();
-    uint8_t ref = EnsureCached(sfi_key, name, name_len, ts);
+    uint32_t idx = EnsureNamed(sfi_key, name, name_len, ts);
     WriteHeader(kTraceFuncEnter, ts);
-    W1(ref);
+    W4(idx);
     W1(is_async ? 1 : 0);
     W4(call_id);
   }
@@ -130,7 +195,6 @@ class TraceWriter {
     EmitFuncEvent(kTraceFuncOnStackReplacement, sfi_key, name, name_len, call_id);
   }
 
-  // ts_start of the JIT window = last_event_ts_; ts_end = NowNs() (in header).
   void WriteOptimizedBatch(uint64_t count) {
     EnsureSpace();
     uint64_t ts_end = NowNs();
@@ -227,19 +291,20 @@ class TraceWriter {
     last_event_ts_ = ts;
   }
 
-  // ── Ensure name is in cache; emit NEW_NAME event if not ────────────────────
-  // Returns the cache ref (1-128) to write into the following call record.
-  // If the name is new, a NEW_NAME record is emitted with the given ts so
-  // the subsequent call record has delta=0.
-  __attribute__((always_inline)) inline uint8_t EnsureCached(
+  // ── Ensure name is indexed; emit NEW_NAME if first time seen ────────────────
+  // Returns the name_idx to embed in the following call record.
+  // If new: emits a NEW_NAME record with the given ts (call record gets delta=0).
+  __attribute__((always_inline)) inline uint32_t EnsureNamed(
       const void* sfi_key, const char* name, int name_len, uint64_t ts) {
-    int dist = CacheLookup(sfi_key);
-    if (__builtin_expect(dist > 0, 1)) return (uint8_t)dist;
-    WriteHeader(kTraceNewName, ts);
-    W2((uint16_t)name_len);
-    WBytes(name, name_len);
-    CacheInsert(sfi_key);
-    return 1;
+    bool is_new;
+    uint32_t idx = name_table_.Upsert(sfi_key, &is_new);
+    if (__builtin_expect(is_new, 0)) {
+      WriteHeader(kTraceNewName, ts);
+      W4(idx);
+      W2((uint16_t)name_len);
+      WBytes(name, name_len);
+    }
+    return idx;
   }
 
   // ── Timestamp of last emitted event ─────────────────────────────────────────
@@ -250,26 +315,8 @@ class TraceWriter {
   std::vector<uint32_t> call_stack_;
   std::unordered_map<uintptr_t, uint32_t> suspended_calls_;
 
-  // ── Function-name ring cache ─────────────────────────────────────────────────
-  const void* cache_[kTraceCacheSize];
-  int cache_head_;
-  int cache_count_;
-
-  __attribute__((always_inline)) inline int CacheLookup(const void* key) {
-    int n = cache_count_;
-    for (int i = 1; i <= n; i++) {
-      int slot = cache_head_ - i;
-      if (slot < 0) slot += kTraceCacheSize;
-      if (cache_[slot] == key) return i;
-    }
-    return 0;
-  }
-
-  __attribute__((always_inline)) inline void CacheInsert(const void* key) {
-    cache_[cache_head_] = key;
-    if (++cache_head_ == kTraceCacheSize) cache_head_ = 0;
-    if (cache_count_ < kTraceCacheSize) ++cache_count_;
-  }
+  // ── SFI pointer → name index table ──────────────────────────────────────────
+  SfiNameTable name_table_;
 
   // ── Core emitter for EXIT / SUSPEND / RESUME / ON_STACK_REPLACEMENT ─────────
   __attribute__((always_inline)) inline void EmitFuncEvent(
@@ -277,9 +324,9 @@ class TraceWriter {
       const char* name, int name_len, uint32_t call_id) {
     EnsureSpace();
     uint64_t ts = NowNs();
-    uint8_t ref = EnsureCached(sfi_key, name, name_len, ts);
+    uint32_t idx = EnsureNamed(sfi_key, name, name_len, ts);
     WriteHeader(type, ts);
-    W1(ref);
+    W4(idx);
     W4(call_id);
   }
 };
