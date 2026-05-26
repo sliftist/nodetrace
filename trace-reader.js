@@ -9,10 +9,11 @@ const EV_ENTER    = 0x00;
 const EV_EXIT     = 0x01;
 const EV_SUSPEND  = 0x02;
 const EV_RESUME   = 0x03;
-const EV_OSR      = 0x04;
-const EV_TURBOFAN = 0x05;
+const EV_ON_STACK_REPLACEMENT = 0x04;
+const EV_OPTIMIZED_BATCH = 0x05;
+const EV_NEWNAME  = 0x06;
 
-const EV_NAME = ['ENTER', 'EXIT', 'SUSPEND', 'RESUME', 'OSR', 'TURBOFAN'];
+const EV_NAME = ['ENTER', 'EXIT', 'SUSPEND', 'RESUME', 'ON_STACK_REPLACEMENT', 'OPTIMIZED_BATCH', 'NEW_NAME'];
 
 // ── Binary reader ──────────────────────────────────────────────────────────────
 // Format: flat stream of records, no per-field tags.
@@ -20,20 +21,22 @@ const EV_NAME = ['ENTER', 'EXIT', 'SUSPEND', 'RESUME', 'OSR', 'TURBOFAN'];
 //     ss=0 → 1-byte delta, ss=1 → 2-byte, ss=2 → 4-byte, ss=3 → 8-byte
 //   Delta timestamp (LE, ss bytes) added to running absolute timestamp
 //   Fixed fields per type (no tags):
-//     ENTER:    func(name-field), is_async(u8), call_id(u32)
-//     EXIT:     func(name-field), call_id(u32)
-//     SUSPEND:  func(name-field), call_id(u32)
-//     RESUME:   func(name-field), call_id(u32)
-//     OSR:      func(name-field), call_id(u32)
-//     TURBOFAN: count(u32)
-//   Name field: byte=0 → new name (u16 len + utf-8, pushed to ring cache)
-//               byte 1-128 → cache back-ref (1=most recent)
+//     NEW_NAME: u16 len + utf-8 bytes  (pushes name to ring cache)
+//     ENTER:    cache_ref(u8), is_async(u8), call_id(u32)
+//     EXIT:     cache_ref(u8), call_id(u32)
+//     SUSPEND:  cache_ref(u8), call_id(u32)
+//     RESUME:   cache_ref(u8), call_id(u32)
+//     ON_STACK_REPLACEMENT: cache_ref(u8), call_id(u32)
+//     OPTIMIZED_BATCH: count(u32)
+//   cache_ref is always 1-128; NEW_NAME is emitted before first use of a name.
 
 function readTrace(buf) {
   let pos = 0;
   const nameCache = [];
   const events = [];
   let lastTs = 0n;
+  const uniqueNames = new Set();
+  let newNameEvents = 0;
 
   const u8  = () => buf[pos++];
   const u16 = () => { const v = buf.readUInt16LE(pos); pos += 2; return v; };
@@ -54,18 +57,7 @@ function readTrace(buf) {
     }
   };
 
-  const readFunc = () => {
-    const prefix = u8();
-    if (prefix === 0) {
-      const len = u16();
-      const name = buf.toString('utf8', pos, pos + len);
-      pos += len;
-      nameCache.unshift(name);
-      if (nameCache.length > 128) nameCache.pop();
-      return name;
-    }
-    return nameCache[prefix - 1] ?? '(unknown)';
-  };
+  const readRef = () => nameCache[u8() - 1] ?? '(unknown)';
 
   while (pos < buf.length) {
     const header = u8();
@@ -76,16 +68,24 @@ function readTrace(buf) {
     lastTs += delta;
     const ts = lastTs;
 
-    if (type === EV_ENTER) {
-      const func    = readFunc();
+    if (type === EV_NEWNAME) {
+      const len  = u16();
+      const name = buf.toString('utf8', pos, pos + len);
+      pos += len;
+      nameCache.unshift(name);
+      if (nameCache.length > 128) nameCache.pop();
+      uniqueNames.add(name);
+      newNameEvents++;
+    } else if (type === EV_ENTER) {
+      const func    = readRef();
       const isAsync = u8();
       const callId  = u32();
       events.push({ type: 'ENTER', ts, func, isAsync: !!isAsync, callId });
-    } else if (type === EV_TURBOFAN) {
+    } else if (type === EV_OPTIMIZED_BATCH) {
       const count = BigInt(u32());
-      events.push({ type: 'TURBOFAN', ts, count });
-    } else if (type <= EV_OSR) {
-      const func   = readFunc();
+      events.push({ type: 'OPTIMIZED_BATCH', ts, count });
+    } else if (type <= EV_ON_STACK_REPLACEMENT) {
+      const func   = readRef();
       const callId = u32();
       events.push({ type: EV_NAME[type], ts, func, callId });
     } else {
@@ -93,7 +93,7 @@ function readTrace(buf) {
     }
   }
 
-  return events;
+  return { events, uniqueNames: uniqueNames.size, newNameEvents };
 }
 
 // ── Analysis ───────────────────────────────────────────────────────────────────
@@ -119,9 +119,9 @@ function summarize(events) {
         const dur = Number(ev.ts - ts);
         wallNs[func] = (wallNs[func] ?? 0) + dur;
       }
-    } else if (ev.type === 'OSR') {
+    } else if (ev.type === 'ON_STACK_REPLACEMENT') {
       osrCount[ev.func] = (osrCount[ev.func] ?? 0) + 1;
-    } else if (ev.type === 'TURBOFAN') {
+    } else if (ev.type === 'OPTIMIZED_BATCH') {
       turboFanTotal += ev.count;
     }
   }
@@ -140,7 +140,7 @@ if (!fs.existsSync(path)) {
 const buf = fs.readFileSync(path);
 console.log(`Read ${buf.length.toLocaleString()} bytes from ${path}`);
 
-const events = readTrace(buf);
+const { events, uniqueNames, newNameEvents } = readTrace(buf);
 console.log(`Decoded ${events.length.toLocaleString()} events\n`);
 
 const { counts, wallNs, callCount, osrCount, turboFanTotal } = summarize(events);
@@ -148,10 +148,12 @@ const { counts, wallNs, callCount, osrCount, turboFanTotal } = summarize(events)
 const ignitionTotal = counts['ENTER'] ?? 0;
 console.log('Event type breakdown:');
 for (const [type, n] of Object.entries(counts)) {
-  console.log(`  ${type.padEnd(12)} ${n.toLocaleString()}`);
+  console.log(`  ${type.padEnd(25)} ${n.toLocaleString()}`);
 }
-console.log(`\n  Ignition calls (ENTER):   ${ignitionTotal.toLocaleString()}`);
-console.log(`  TurboFan calls (batched): ${turboFanTotal.toLocaleString()}`);
+console.log(`  ${'NEW_NAME (emitted)'.padEnd(25)} ${newNameEvents.toLocaleString()}`);
+console.log(`  ${'Unique function names'.padEnd(25)} ${uniqueNames.toLocaleString()}`);
+console.log(`\n  Ignition calls (ENTER):    ${ignitionTotal.toLocaleString()}`);
+console.log(`  Optimized calls (batched): ${turboFanTotal.toLocaleString()}`);
 console.log(`  Total accounted calls:    ${(BigInt(ignitionTotal) + turboFanTotal).toLocaleString()}`);
 
 const top = Object.entries(wallNs)

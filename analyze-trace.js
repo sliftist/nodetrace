@@ -5,8 +5,9 @@ const EV_ENTER    = 0x00;
 const EV_EXIT     = 0x01;
 const EV_SUSPEND  = 0x02;
 const EV_RESUME   = 0x03;
-const EV_OSR      = 0x04;
-const EV_TURBOFAN = 0x05;
+const EV_ON_STACK_REPLACEMENT = 0x04;
+const EV_OPTIMIZED_BATCH = 0x05;
+const EV_NEWNAME  = 0x06;
 
 function readTrace(buf) {
   let pos = 0;
@@ -33,18 +34,7 @@ function readTrace(buf) {
     }
   };
 
-  const readFunc = () => {
-    const prefix = u8();
-    if (prefix === 0) {
-      const len = u16();
-      const name = buf.toString('utf8', pos, pos + len);
-      pos += len;
-      nameCache.unshift(name);
-      if (nameCache.length > 128) nameCache.pop();
-      return name;
-    }
-    return nameCache[prefix - 1] ?? '(unknown)';
-  };
+  const readRef = () => nameCache[u8() - 1] ?? '(unknown)';
 
   while (pos < buf.length) {
     const header = u8();
@@ -55,18 +45,24 @@ function readTrace(buf) {
     lastTs += delta;
     const ts = lastTs;
 
-    if (type === EV_ENTER) {
-      const func    = readFunc();
+    if (type === EV_NEWNAME) {
+      const len  = u16();
+      const name = buf.toString('utf8', pos, pos + len);
+      pos += len;
+      nameCache.unshift(name);
+      if (nameCache.length > 128) nameCache.pop();
+    } else if (type === EV_ENTER) {
+      const func    = readRef();
       const isAsync = u8();
       const callId  = u32();
       events.push({ type: 'ENTER', ts, func, isAsync: !!isAsync, callId });
-    } else if (type === EV_TURBOFAN) {
+    } else if (type === EV_OPTIMIZED_BATCH) {
       const count = BigInt(u32());
-      events.push({ type: 'TURBOFAN', ts, count });
-    } else if (type <= EV_OSR) {
-      const func   = readFunc();
+      events.push({ type: 'OPTIMIZED_BATCH', ts, count });
+    } else if (type <= EV_ON_STACK_REPLACEMENT) {
+      const func   = readRef();
       const callId = u32();
-      events.push({ type: ['ENTER','EXIT','SUSPEND','RESUME','OSR'][type], ts, func, callId });
+      events.push({ type: ['ENTER','EXIT','SUSPEND','RESUME','ON_STACK_REPLACEMENT'][type], ts, func, callId });
     } else {
       throw new Error(`Unknown event type 0x${type.toString(16)} at offset ${pos}`);
     }
@@ -84,7 +80,7 @@ function analyze(events) {
   let turboFanTotal = 0n;
 
   for (const ev of events) {
-    if (ev.type === 'TURBOFAN') { turboFanTotal += ev.count; continue; }
+    if (ev.type === 'OPTIMIZED_BATCH') { turboFanTotal += ev.count; continue; }
 
     if (ev.type === 'ENTER') {
       uniqueFuncs.add(ev.func);
@@ -137,7 +133,7 @@ console.log('│           Trace summary                 │');
 console.log('├─────────────────────────────────────────┤');
 console.log(`│  Unique functions traced   ${String(uniqueFuncs).padStart(12)} │`);
 console.log(`│  Total Ignition calls      ${String(totalCalls.toLocaleString()).padStart(12)} │`);
-console.log(`│  TurboFan calls (batched)  ${String(turboFanTotal.toLocaleString()).padStart(12)} │`);
+console.log(`│  Optimized calls (batched) ${String(turboFanTotal.toLocaleString()).padStart(12)} │`);
 console.log('└─────────────────────────────────────────┘');
 
 const top = Object.entries(ownNs)

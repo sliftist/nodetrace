@@ -12487,6 +12487,14 @@ ReduceResult MaglevGraphBuilder::VisitCallRuntime() {
           {current_interpreter_frame_.get(args[0])}));
       SetAccumulator(GetRootConstant(RootIndex::kUndefinedValue));
       return ReduceResult::Done();
+    case Runtime::kTraceEnter:
+    case Runtime::kTraceAsyncSuspend:
+    case Runtime::kTraceAsyncResume:
+      SetAccumulator(GetRootConstant(RootIndex::kUndefinedValue));
+      return ReduceResult::Done();
+    case Runtime::kTraceExit:
+      SetAccumulator(current_interpreter_frame_.get(args[0]));
+      return ReduceResult::Done();
     default:
       break;
   }

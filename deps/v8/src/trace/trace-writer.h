@@ -22,29 +22,36 @@
 //            absolute ts = running sum of all deltas since t=0
 //   [fields] fixed layout determined by type — no per-field tags
 //
-// FUNCTION NAME FIELD (used in ENTER/EXIT/SUSPEND/RESUME/OSR):
+// FUNCTION NAME FIELD (used in ENTER/EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT):
 //   [uint8]  prefix
 //     0       → new name: [uint16-LE len][utf-8 bytes], pushed to ring cache
 //     1..128  → cache ref: distance into ring (1 = most recently seen)
 //
 // EVENT TYPES (type field, bottom 6 bits of header):
-//   0x00  FUNC_ENTER    func, is_async(u8), call_id(u32-LE)
-//   0x01  FUNC_EXIT     func, call_id(u32-LE)
-//   0x02  ASYNC_SUSPEND func, call_id(u32-LE)
-//   0x03  ASYNC_RESUME  func, call_id(u32-LE)
-//   0x04  FUNC_OSR      func, call_id(u32-LE)
-//   0x05  TURBOFAN_BATCH  count(u32-LE)
+//   0x00  FUNC_ENTER    cache_ref(u8), is_async(u8), call_id(u32-LE)
+//   0x01  FUNC_EXIT     cache_ref(u8), call_id(u32-LE)
+//   0x02  ASYNC_SUSPEND cache_ref(u8), call_id(u32-LE)
+//   0x03  ASYNC_RESUME  cache_ref(u8), call_id(u32-LE)
+//   0x04  FUNC_ON_STACK_REPLACEMENT  cache_ref(u8), call_id(u32-LE)
+//   0x05  OPTIMIZED_BATCH  count(u32-LE)
 //            ts in header = ts_end of the JIT window
 //            ts_start is implicitly the previous record's timestamp
+//   0x06  NEW_NAME      len(u16-LE), utf-8 bytes
+//            Pushes a new name onto the ring cache.  Always emitted
+//            immediately before the first call event that uses it,
+//            with the same timestamp (delta = 0 on the following record).
+//
+// cache_ref is always 1-128 (1 = most-recently-pushed name).
+// NEW_NAME is emitted automatically; readers never see cache_ref = 0.
 //
 // call_id is a process-global u32 counter incremented on every ENTER.
 // SUSPEND/RESUME/EXIT carry the same call_id as their matching ENTER.
 //
 // Approximate record sizes (delta fits in 1 byte — typical between events):
-//   ENTER  (cached name):   1 + 1 + 1 + 1 + 4 =  8 bytes
-//   ENTER  (new name, N):   1 + 1 + 1+2+N + 1 + 4 = 10+N bytes
-//   EXIT/SUSPEND/RESUME/OSR (cached): 1 + 1 + 1 + 4 = 7 bytes
-//   TURBOFAN_BATCH:         1 + 1 + 4 = 6 bytes
+//   NEW_NAME (len N):       1 + 1 + 2 + N = 4+N bytes
+//   ENTER:                  1 + 1 + 1 + 1 + 4 = 8 bytes  (delta=0 if name was new)
+//   EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT: 1 + 1 + 1 + 4 = 7 bytes
+//   OPTIMIZED_BATCH:        1 + 1 + 4 = 6 bytes
 
 namespace v8 {
 namespace internal {
@@ -58,8 +65,9 @@ enum TraceEventType : uint8_t {
   kTraceFuncExit      = 0x01,
   kTraceAsyncSuspend  = 0x02,
   kTraceAsyncResume   = 0x03,
-  kTraceFuncOSR       = 0x04,
-  kTraceTurboFanBatch = 0x05,
+  kTraceFuncOnStackReplacement = 0x04,
+  kTraceOptimizedBatch = 0x05,
+  kTraceNewName       = 0x06,
 };
 
 class TraceWriter {
@@ -94,8 +102,9 @@ class TraceWriter {
     uint32_t call_id = next_call_id_++;
     call_stack_.push_back(call_id);
     uint64_t ts = NowNs();
+    uint8_t ref = EnsureCached(sfi_key, name, name_len, ts);
     WriteHeader(kTraceFuncEnter, ts);
-    WriteFunc(sfi_key, name, name_len);
+    W1(ref);
     W1(is_async ? 1 : 0);
     W4(call_id);
   }
@@ -115,17 +124,17 @@ class TraceWriter {
     EmitFuncEvent(kTraceAsyncSuspend, sfi_key, name, name_len, call_id);
   }
 
-  __attribute__((noinline)) void WriteOSR(
+  __attribute__((noinline)) void WriteOnStackReplacement(
       const void* sfi_key, const char* name, int name_len) {
     uint32_t call_id = call_stack_.empty() ? 0 : call_stack_.back();
-    EmitFuncEvent(kTraceFuncOSR, sfi_key, name, name_len, call_id);
+    EmitFuncEvent(kTraceFuncOnStackReplacement, sfi_key, name, name_len, call_id);
   }
 
   // ts_start of the JIT window = last_event_ts_; ts_end = NowNs() (in header).
-  void WriteTurboFanBatch(uint64_t count) {
+  void WriteOptimizedBatch(uint64_t count) {
     EnsureSpace();
     uint64_t ts_end = NowNs();
-    WriteHeader(kTraceTurboFanBatch, ts_end);
+    WriteHeader(kTraceOptimizedBatch, ts_end);
     W4((uint32_t)count);
   }
 
@@ -164,7 +173,7 @@ class TraceWriter {
   int      fd_;
 
   __attribute__((always_inline)) inline void EnsureSpace() {
-    if (__builtin_expect(ptr_ + kMaxTraceRecord > buf_end_, 0))
+    if (__builtin_expect(ptr_ + 2 * kMaxTraceRecord > buf_end_, 0))
       FlushBuffer();
   }
 
@@ -218,19 +227,19 @@ class TraceWriter {
     last_event_ts_ = ts;
   }
 
-  // ── Function name/ref field ─────────────────────────────────────────────────
-  // 0 = new name (uint16 len + bytes), 1..128 = cache distance
-  __attribute__((always_inline)) inline void WriteFunc(
-      const void* sfi_key, const char* name, int name_len) {
+  // ── Ensure name is in cache; emit NEW_NAME event if not ────────────────────
+  // Returns the cache ref (1-128) to write into the following call record.
+  // If the name is new, a NEW_NAME record is emitted with the given ts so
+  // the subsequent call record has delta=0.
+  __attribute__((always_inline)) inline uint8_t EnsureCached(
+      const void* sfi_key, const char* name, int name_len, uint64_t ts) {
     int dist = CacheLookup(sfi_key);
-    if (dist > 0) {
-      W1((uint8_t)dist);
-    } else {
-      W1(0);
-      CacheInsert(sfi_key);
-      W2((uint16_t)name_len);
-      WBytes(name, name_len);
-    }
+    if (__builtin_expect(dist > 0, 1)) return (uint8_t)dist;
+    WriteHeader(kTraceNewName, ts);
+    W2((uint16_t)name_len);
+    WBytes(name, name_len);
+    CacheInsert(sfi_key);
+    return 1;
   }
 
   // ── Timestamp of last emitted event ─────────────────────────────────────────
@@ -262,14 +271,15 @@ class TraceWriter {
     if (cache_count_ < kTraceCacheSize) ++cache_count_;
   }
 
-  // ── Core emitter for EXIT / SUSPEND / RESUME / OSR ──────────────────────────
+  // ── Core emitter for EXIT / SUSPEND / RESUME / ON_STACK_REPLACEMENT ─────────
   __attribute__((always_inline)) inline void EmitFuncEvent(
       TraceEventType type, const void* sfi_key,
       const char* name, int name_len, uint32_t call_id) {
     EnsureSpace();
     uint64_t ts = NowNs();
+    uint8_t ref = EnsureCached(sfi_key, name, name_len, ts);
     WriteHeader(type, ts);
-    WriteFunc(sfi_key, name, name_len);
+    W1(ref);
     W4(call_id);
   }
 };

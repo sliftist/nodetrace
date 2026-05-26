@@ -25,6 +25,7 @@
 #include "src/deoptimizer/frame-translation-builder.h"
 #include "src/execution/frame-constants.h"
 #include "src/flags/flags.h"
+#include "src/codegen/external-reference.h"
 #include "src/handles/global-handles-inl.h"
 #include "src/interpreter/bytecode-register.h"
 #include "src/maglev/maglev-assembler-inl.h"
@@ -44,6 +45,11 @@
 
 namespace v8 {
 namespace internal {
+
+extern uint64_t g_turbofan_call_count;
+class TraceWriter;
+TraceWriter* GetGlobalTraceWriter();
+
 namespace maglev {
 
 #define __ masm()->
@@ -741,6 +747,12 @@ class MaglevCodeGeneratingNodeProcessor {
       __ OSRPrologue(graph);
     } else {
       __ Prologue(graph);
+    }
+
+    if (GetGlobalTraceWriter()) {
+      ExternalReference count_ref = ExternalReference::Create(
+          reinterpret_cast<Address>(&g_turbofan_call_count));
+      masm()->incq(masm()->ExternalReferenceAsOperand(count_ref));
     }
 
     // Maglev always sets up a frame.

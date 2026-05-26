@@ -272,7 +272,7 @@ void CodeGenerator::AssembleCode() {
     }
     // If tracing is active, emit a single incq at every TurboFan function
     // entry so the Ignition trace events can report how many JIT'd calls
-    // happened in between (TURBOFAN_BATCH events).
+    // happened in between (OPTIMIZED_BATCH events).
     if (GetGlobalTraceWriter()) {
       ExternalReference count_ref = ExternalReference::Create(
           reinterpret_cast<Address>(&g_turbofan_call_count));

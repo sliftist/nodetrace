@@ -30,26 +30,32 @@ Four new runtime functions handle the events:
 Each function calls `MaybeInitTraceWriter()` which lazily opens the output file
 on first call (skipped entirely in `mksnapshot` to avoid bootstrapping issues).
 
-### TurboFan hook stripping (`deps/v8/src/compiler/bytecode-graph-builder.cc`)
+### JIT hook stripping
 
-When TurboFan compiles a hot function it strips the `CallRuntime(TraceEnter/Exit)`
-bytecodes completely — they are replaced with no-ops. This means **JIT-compiled
-functions run with zero tracing overhead**. Their call counts are still tracked
-via a single `incq` counter at the JIT'd function prologue (see TURBOFAN_BATCH).
+When Sparkplug, Maglev, or TurboFan compiles a hot function it strips the
+`CallRuntime(TraceEnter/Exit)` bytecodes completely — they are replaced with
+no-ops. This means **JIT-compiled functions run with zero tracing overhead**.
+Their call counts are still tracked via a single `incq` counter at the JIT'd
+function prologue (see OPTIMIZED_BATCH).
 
-### TurboFan prologue counter (`deps/v8/src/compiler/code-generator.cc`)
+- TurboFan: `deps/v8/src/compiler/bytecode-graph-builder.cc` (VisitCallRuntime)
+- Maglev: `deps/v8/src/maglev/maglev-graph-builder.cc` (VisitCallRuntime)
 
-A single `incq` instruction is injected at the entry of every TurboFan-compiled
-function. This increments `g_turbofan_call_count`. Before each Ignition trace
-event, the counter is drained into a `TURBOFAN_BATCH` record if non-zero.
+### JIT prologue counter
+
+A single `incq` instruction is injected at the entry of every Maglev- or
+TurboFan-compiled function. This increments `g_turbofan_call_count`. Before
+each Ignition trace event, the counter is drained into an `OPTIMIZED_BATCH`
+record if non-zero.
+
+- TurboFan: `deps/v8/src/compiler/backend/code-generator.cc`
+- Maglev: `deps/v8/src/maglev/maglev-code-generator.cc`
 
 ### Compiler flags (`deps/v8/src/flags/flag-definitions.h`)
 
-- Maglev and Sparkplug (baseline JIT) are disabled — they bypass Ignition and
-  would miss the trace hooks before the function gets fully JIT-compiled.
 - `turbo_filter` is `"*"` — V8 naturally JITs hot functions as it normally would.
-  Hot functions run at full speed with zero tracing overhead; only Ignition
-  functions (cold or below the JIT threshold) are traced.
+- Sparkplug and Maglev are enabled. Hot functions run at full speed with zero
+  tracing overhead; only Ignition-interpreted functions are traced.
 
 ### Trace writer (`deps/v8/src/trace/trace-writer.h`)
 
@@ -93,39 +99,38 @@ boundary. See `deps/v8/src/trace/trace-writer.h` for the authoritative spec.
 The absolute timestamp is the running sum of all deltas since t=0.
 Consecutive events typically differ by < 255 ns, so the delta fits in 1 byte.
 
-### Function name field (used in ENTER/EXIT/SUSPEND/RESUME/OSR)
-
-```
-[uint8 prefix]
-  0        → new name: [uint16-LE len][utf-8 bytes], pushed to 128-entry ring cache
-  1..128   → cache ref: distance (1 = most-recently-seen name)
-```
-
 ### Event types
 
-| Value | Name           | Fields after header+delta                       |
-|-------|----------------|-------------------------------------------------|
-| 0x00  | FUNC_ENTER     | func(name-field), is_async(u8), call_id(u32-LE) |
-| 0x01  | FUNC_EXIT      | func(name-field), call_id(u32-LE)               |
-| 0x02  | ASYNC_SUSPEND  | func(name-field), call_id(u32-LE)               |
-| 0x03  | ASYNC_RESUME   | func(name-field), call_id(u32-LE)               |
-| 0x04  | FUNC_OSR       | func(name-field), call_id(u32-LE)               |
-| 0x05  | TURBOFAN_BATCH | count(u32-LE)                                   |
+| Value | Name           | Fields after header+delta                        |
+|-------|----------------|--------------------------------------------------|
+| 0x06  | NEW_NAME       | len(u16-LE), utf-8 bytes                         |
+| 0x00  | FUNC_ENTER     | cache_ref(u8), is_async(u8), call_id(u32-LE)     |
+| 0x01  | FUNC_EXIT      | cache_ref(u8), call_id(u32-LE)                   |
+| 0x02  | ASYNC_SUSPEND  | cache_ref(u8), call_id(u32-LE)                   |
+| 0x03  | ASYNC_RESUME   | cache_ref(u8), call_id(u32-LE)                   |
+| 0x04  | FUNC_ON_STACK_REPLACEMENT | cache_ref(u8), call_id(u32-LE)          |
+| 0x05  | OPTIMIZED_BATCH | count(u32-LE)                                    |
+
+NEW_NAME pushes the name string onto the 128-entry ring cache.
+It is always emitted immediately before the first call event that uses that
+name, sharing the same timestamp (the following call event has delta=0).
+
+`cache_ref` is always 1–128 (1 = most-recently-pushed name).
 
 `call_id` is a process-global uint32 counter incremented on every ENTER.
 SUSPEND/RESUME/EXIT carry the same `call_id` as their matching ENTER.
 
-For TURBOFAN_BATCH: `ts` in the header is the end of the JIT window;
+For OPTIMIZED_BATCH: `ts` in the header is the end of the JIT window;
 `ts_start` is implicitly the previous record's timestamp.
 
 ### Approximate record sizes (delta fits in 1 byte — typical)
 
-| Event                   | Size |
-|-------------------------|------|
-| ENTER (cached name)     | 8 B  |
-| ENTER (new name, len N) | 10+N B |
-| EXIT/SUSPEND/RESUME/OSR (cached) | 7 B |
-| TURBOFAN_BATCH          | 6 B  |
+| Event                   | Size   |
+|-------------------------|--------|
+| NEW_NAME (len N)        | 4+N B  |
+| ENTER                   | 8 B    |
+| EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT | 7 B |
+| OPTIMIZED_BATCH          | 6 B    |
 
 ### Decoding
 

@@ -740,7 +740,7 @@ RUNTIME_FUNCTION(Runtime_LogOrTraceOptimizedOSREntry) {
       const char* nm = name_buf.get();
       int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
       if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
-      tw->WriteOSR(key, nm, nm_len);
+      tw->WriteOnStackReplacement(key, nm, nm_len);
     }
   }
 

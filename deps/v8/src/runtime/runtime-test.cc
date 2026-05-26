@@ -1738,13 +1738,13 @@ uint64_t g_turbofan_call_count = 0;
 // circular include or a separate translation unit for g_trace_writer.
 TraceWriter* GetGlobalTraceWriter() { return g_trace_writer; }
 
-// Emit a TURBOFAN_BATCH event if any TurboFan calls accumulated since the
+// Emit a OPTIMIZED_BATCH event if any TurboFan calls accumulated since the
 // last Ignition event.  Call this before every Write* on g_trace_writer.
-static inline void DrainTurboFanCount() {
+static inline void DrainOptimizedCount() {
   if (g_turbofan_call_count > 0 && g_trace_writer) {
     uint64_t n = g_turbofan_call_count;
     g_turbofan_call_count = 0;
-    g_trace_writer->WriteTurboFanBatch(n);
+    g_trace_writer->WriteOptimizedBatch(n);
   }
 }
 
@@ -1763,7 +1763,7 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
     int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
     if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
     bool is_async = IsAsyncFunction(sfi->kind());
-    DrainTurboFanCount();
+    DrainOptimizedCount();
     g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async);
   }
   return ReadOnlyRoots(isolate).undefined_value();
@@ -1784,7 +1784,7 @@ RUNTIME_FUNCTION(Runtime_TraceExit) {
     const char* nm = name.get();
     int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
     if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
-    DrainTurboFanCount();
+    DrainOptimizedCount();
     g_trace_writer->WriteFuncExit(key, nm, nm_len);
   }
   return obj;  // must return TOS unchanged
@@ -1823,7 +1823,7 @@ RUNTIME_FUNCTION(Runtime_TraceAsyncSuspend) {
     const void* key; const char* nm; int nm_len;
     std::unique_ptr<char[]> storage;
     if (GetTopFrameSFI(isolate, &key, &nm, &nm_len, &storage)) {
-      DrainTurboFanCount();
+      DrainOptimizedCount();
       g_trace_writer->WriteAsyncSuspend(gen_key, key, nm, nm_len);
     }
   }
@@ -1842,7 +1842,7 @@ RUNTIME_FUNCTION(Runtime_TraceAsyncResume) {
     const void* key; const char* nm; int nm_len;
     std::unique_ptr<char[]> storage;
     if (GetTopFrameSFI(isolate, &key, &nm, &nm_len, &storage)) {
-      DrainTurboFanCount();
+      DrainOptimizedCount();
       g_trace_writer->WriteAsyncResume(gen_key, key, nm, nm_len);
     }
   }
