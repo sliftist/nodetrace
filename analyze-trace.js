@@ -52,10 +52,19 @@ function readTrace(buf) {
       pos += len;
       names[idx] = name;
     } else if (type === EV_ENTER) {
-      const func    = readRef();
-      const isAsync = u8();
-      const callId  = u32();
-      events.push({ type: 'ENTER', ts, func, isAsync: !!isAsync, callId });
+      const func       = readRef();
+      const isAsync    = u8();
+      const callId     = u32();
+      const paramCount = u8();
+      const params = [];
+      for (let i = 0; i < paramCount; i++) {
+        const nameIdx = u32();
+        const name    = names[nameIdx] ?? `arg${i}`;
+        const tag     = u8();
+        const value   = (tag === 2 || tag === 3 || tag === 4) ? u64() : undefined;
+        params.push({ name, tag, value });
+      }
+      events.push({ type: 'ENTER', ts, func, isAsync: !!isAsync, callId, params });
     } else if (type === EV_OPTIMIZED_BATCH) {
       const count = BigInt(u32());
       const minTs = u64();

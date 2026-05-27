@@ -41,6 +41,12 @@ function readTrace(buf) {
       names[idx] = buf.toString('utf8', pos, pos + len); pos += len;
     } else if (type === EV_ENTER) {
       const func = names[u32()] ?? '(unknown)', isAsync = u8(), callId = u32();
+      const paramCount = u8();
+      for (let i = 0; i < paramCount; i++) {
+        u32();  // name_idx
+        const tag = u8();
+        if (tag === 2 || tag === 3 || tag === 4) u64();  // value
+      }
       events.push({ type: 'ENTER', ts, func, isAsync: !!isAsync, callId });
     } else if (type === EV_RESUME) {
       const func = names[u32()] ?? '(unknown)', callId = u32();

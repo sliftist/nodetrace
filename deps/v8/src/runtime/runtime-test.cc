@@ -40,6 +40,8 @@
 #include "src/ic/stub-cache.h"
 #include "src/objects/bytecode-array.h"
 #include "src/objects/js-collection-inl.h"
+#include "src/objects/scope-info.h"
+#include "src/objects/string.h"
 #include "src/profiler/heap-profiler.h"
 #include "src/sandbox/bytecode-verifier.h"
 #include "src/utils/utils.h"
@@ -1683,6 +1685,7 @@ namespace {
 TraceWriter* g_trace_writer = nullptr;
 std::once_flag g_trace_init_flag;
 static bool g_shim_done = false;  // for setting globalThis.TRUE_TIME_ALREADY_SHIMMED
+static bool g_trace_params = false;  // set when NODE_TRACE_PARAMS=1
 
 // Opaque storage for uv_timer_t (152 bytes on Linux x64; 256 is safe).
 alignas(8) static char g_uv_timer_buf[256];
@@ -1722,6 +1725,7 @@ void MaybeInitTraceWriter() {
     if (IsMksnapshot()) return;
     const char* path = getenv("NODE_TRACE_FILE");
     if (!path || path[0] == '\0') return;  // only trace when explicitly requested
+    g_trace_params = (getenv("NODE_TRACE_PARAMS") != nullptr);
     {
       g_trace_writer = new TraceWriter();
       if (!g_trace_writer->Initialize(path)) {
@@ -1834,6 +1838,8 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
   }
 
   SealHandleScope shs(isolate);
+
+  // Get SFI
   Tagged<SharedFunctionInfo> sfi;
   if (args.length() >= 1) {
     sfi = Cast<JSFunction>(args[0])->shared();
@@ -1845,15 +1851,120 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
   const void* key = reinterpret_cast<const void*>(sfi.ptr());
   bool is_async = IsAsyncFunction(sfi->kind());
   DrainOptimizedCount();
-  if (g_trace_writer->HasName(key)) {
-    g_trace_writer->WriteFuncEnter(key, nullptr, 0, is_async);
-  } else {
-    std::unique_ptr<char[]> name = sfi->DebugNameCStr();
-    const char* nm = name.get();
-    int nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
+
+  // Get function name if new
+  std::unique_ptr<char[]> name_owner;
+  const char* nm = nullptr;
+  int nm_len = 0;
+  if (!g_trace_writer->HasName(key)) {
+    name_owner = sfi->DebugNameCStr();
+    nm = name_owner.get();
+    nm_len = nm ? static_cast<int>(strlen(nm)) : 0;
     if (nm_len == 0) { nm = "(anonymous)"; nm_len = 11; }
-    g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async);
   }
+
+  if (!g_trace_params) {
+    g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async);
+    return ReadOnlyRoots(isolate).undefined_value();
+  }
+
+  // ── Param collection ──────────────────────────────────────────────────────
+  static const int kMaxP = 10;
+  TraceWriter::RawParamInfo raw_params[kMaxP];
+  int raw_param_count = 0;
+
+  {
+    DisallowGarbageCollection no_gc;
+    Tagged<ScopeInfo> scope_info = sfi->scope_info();
+    int declared = scope_info->ParameterCount();
+
+    // Build param_idx → name mapping from context locals
+    char name_bufs[kMaxP][64];
+    uint32_t name_lens[kMaxP] = {};
+    const void* name_ptrs[kMaxP] = {};
+    bool has_name[kMaxP] = {};
+
+    for (auto it : ScopeInfo::IterateLocalNames(scope_info, no_gc)) {
+      int var = it->index();
+      if (!scope_info->ContextLocalIsParameter(var)) continue;
+      uint32_t pnum = scope_info->ContextLocalParameterNumber(var);
+      if (static_cast<int>(pnum) >= kMaxP || static_cast<int>(pnum) >= declared) continue;
+      Tagged<String> name_str = it->name();
+      uint32_t len = name_str->length();
+      if (len >= 63) len = 62;
+      String::WriteToFlat(name_str, reinterpret_cast<uint8_t*>(name_bufs[pnum]), 0, len);
+      name_bufs[pnum][len] = '\0';
+      name_lens[pnum] = len;
+      name_ptrs[pnum] = reinterpret_cast<const void*>(name_str.ptr());
+      has_name[pnum] = true;
+    }
+
+    // Get actual arg count from frame
+    JavaScriptStackFrameIterator frame_it(isolate);
+    int actual = frame_it.done() ? 0 : frame_it.frame()->ComputeParametersCount();
+
+    int to_trace = declared < actual ? declared : actual;
+    if (to_trace > kMaxP) to_trace = kMaxP;
+    raw_param_count = declared < kMaxP ? declared : kMaxP;
+
+    char pos_bufs[kMaxP][8];
+    for (int i = 0; i < raw_param_count; i++) {
+      TraceWriter::RawParamInfo& rp = raw_params[i];
+
+      // Name
+      if (has_name[i]) {
+        rp.name_fast_ptr = name_ptrs[i];
+        rp.name_str = name_bufs[i];
+        rp.name_len = name_lens[i];
+      } else {
+        snprintf(pos_bufs[i], sizeof(pos_bufs[i]), "arg%d", i);
+        rp.name_fast_ptr = nullptr;
+        rp.name_str = pos_bufs[i];
+        rp.name_len = static_cast<uint32_t>(strlen(pos_bufs[i]));
+      }
+
+      // Value
+      if (i >= to_trace) {
+        rp.type_tag = 0; rp.value = 0;  // undefined (param declared but not passed)
+      } else {
+        Tagged<Object> val = frame_it.frame()->GetParameter(i);
+        if (IsUndefined(val, isolate)) {
+          rp.type_tag = 0; rp.value = 0;
+        } else if (IsNull(val, isolate)) {
+          rp.type_tag = 1; rp.value = 0;
+        } else if (IsBoolean(val)) {
+          rp.type_tag = 2;
+          rp.value = IsTrue(val, isolate) ? 1 : 0;
+        } else if (IsNumber(val)) {
+          double d = Object::NumberValue(val);
+          int32_t i32 = static_cast<int32_t>(d);
+          if (static_cast<double>(i32) == d) {
+            rp.type_tag = 3;
+            rp.value = static_cast<uint64_t>(static_cast<int64_t>(i32));
+          } else {
+            rp.type_tag = 4;
+            rp.value = base::bit_cast<uint64_t>(d);
+          }
+        } else if (IsString(val)) {
+          rp.type_tag = 5; rp.value = 0;
+        } else if (IsJSArray(val)) {
+          rp.type_tag = 7; rp.value = 0;
+        } else if (IsJSFunction(val)) {
+          rp.type_tag = 8; rp.value = 0;
+        } else if (IsJSObject(val)) {
+          rp.type_tag = 6; rp.value = 0;
+        } else if (IsSymbol(val)) {
+          rp.type_tag = 9; rp.value = 0;
+        } else if (IsBigInt(val)) {
+          rp.type_tag = 10; rp.value = 0;
+        } else {
+          rp.type_tag = 6; rp.value = 0;
+        }
+      }
+    }
+  }
+
+  g_trace_writer->WriteFuncEnter(key, nm, nm_len, is_async, raw_params, raw_param_count);
   return ReadOnlyRoots(isolate).undefined_value();
 }
 

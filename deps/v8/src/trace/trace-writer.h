@@ -25,7 +25,14 @@
 // EVENT TYPES (type field, bottom 6 bits of header):
 //
 //   START events — each has a matching END identified by call_id:
-//   0x00  FUNC_ENTER    name_idx(u32-LE), is_async(u8), call_id(u32-LE)
+//   0x00  FUNC_ENTER    name_idx(u32-LE), is_async(u8), call_id(u32-LE),
+//                       param_count(u8),
+//                       [name_idx(u32-LE), type_tag(u8),
+//                        value(u64-LE) — only if type_tag ∈ {2,3,4}] × param_count
+//         param_count is always written (0 when NODE_TRACE_PARAMS not set).
+//         type_tag values:
+//           0=undefined  1=null    2=boolean  3=integer  4=float
+//           5=string     6=object  7=array    8=function 9=symbol  10=bigint
 //   0x03  ASYNC_RESUME  name_idx(u32-LE), call_id(u32-LE)
 //
 //   END events — matched to their START by call_id:
@@ -43,9 +50,11 @@
 //            max_ts: latest ns-since-epoch ts of any dropped call EXIT.
 //            For JIT batches (single ts known): min_ts = max_ts = ts.
 //   0x06  NEW_NAME      name_idx(u32-LE), len(u16-LE), utf-8 bytes
-//            Assigns a permanent index to a function name.  Always emitted
-//            before the first call event that references that name_idx.
-//            The following call event has delta=0 (same timestamp).
+//            Assigns a permanent index to a function or parameter name.
+//            Always emitted before the first call event that references that
+//            name_idx.  The following call event has delta=0 (same timestamp).
+//            Both function names and parameter names share the same counter and
+//            the same JS names[] array.
 //
 // name_idx is assigned in order of first appearance (0, 1, 2, ...).
 // The reader maintains a flat array: names[name_idx] = string.
@@ -68,7 +77,8 @@
 //
 // Approximate record sizes (delta fits in 1 byte — typical between events):
 //   NEW_NAME (len N):                     1 + 1 + 4 + 2 + N = 8+N bytes
-//   ENTER:                                1 + 1 + 4 + 1 + 4 = 11 bytes
+//   ENTER (no params):                    1 + 1 + 4 + 1 + 4 + 1 = 12 bytes
+//   ENTER (k params, all with value):     12 + k*(4+1+8) = 12+13k bytes
 //   EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT: 1 + 1 + 4 + 4 = 10 bytes
 //   OPTIMIZED_BATCH:                      1 + 1 + 4 + 8 + 8 = 22 bytes
 
@@ -77,6 +87,33 @@ namespace internal {
 
 static constexpr size_t kTraceChunkSize = 128ULL * 1024 * 1024;
 static constexpr size_t kMaxTraceRecord = 512;
+
+// Maximum number of parameters captured per ENTER event.
+static constexpr int kMaxParams = 10;
+
+// Type tags for parameter values in ENTER records.
+enum ParamType : uint8_t {
+  kParamUndefined = 0,
+  kParamNull      = 1,
+  kParamBoolean   = 2,   // value: u64 0 or 1
+  kParamInteger   = 3,   // value: u64 sign-extended i32 (when double == int32 cast)
+  kParamFloat     = 4,   // value: u64 IEEE-754 bits of the double
+  kParamString    = 5,   // no value
+  kParamObject    = 6,   // no value
+  kParamArray     = 7,   // no value
+  kParamFunction  = 8,   // no value
+  kParamSymbol    = 9,   // no value
+  kParamBigInt    = 10,  // no value
+};
+
+// One param slot in a StagedEvent.  16 bytes.
+struct ParamSlot {
+  uint32_t name_idx;
+  uint8_t  type_tag;
+  uint8_t  _pad[3];
+  uint64_t value;
+};
+static_assert(sizeof(ParamSlot) == 16, "ParamSlot must be 16 bytes");
 
 enum TraceEventType : uint8_t {
   // START events (matched to END by call_id):
@@ -98,23 +135,23 @@ class SfiNameTable {
  public:
   struct Slot { const void* ptr; uint32_t idx; };
 
-  SfiNameTable() : slots_(nullptr), capacity_(0), count_(0), next_idx_(0) {
+  SfiNameTable() : slots_(nullptr), capacity_(0), count_(0) {
     Resize(16);
   }
   ~SfiNameTable() { free(slots_); }
 
-  // Returns the existing index for ptr, or assigns next_idx_ and returns that.
+  // Returns the existing index for ptr, or uses new_id for a fresh slot.
   // Sets *is_new=true when a fresh index was assigned.
-  __attribute__((always_inline)) inline uint32_t Upsert(const void* ptr, bool* is_new) {
+  __attribute__((always_inline)) inline uint32_t Upsert(const void* ptr, bool* is_new, uint32_t new_id) {
     if (__builtin_expect(count_ > (capacity_ >> 2), 0)) Resize(capacity_ << 2);
     uint32_t h = Hash(ptr), i = 0;
     for (;;) {
       uint32_t s = (h + i++) & (capacity_ - 1);
       if (!slots_[s].ptr) {
-        slots_[s] = {ptr, next_idx_};
+        slots_[s] = {ptr, new_id};
         count_++;
         *is_new = true;
-        return next_idx_++;
+        return new_id;
       }
       if (slots_[s].ptr == ptr) { *is_new = false; return slots_[s].idx; }
     }
@@ -133,7 +170,6 @@ class SfiNameTable {
   Slot*    slots_;
   uint32_t capacity_;
   uint32_t count_;
-  uint32_t next_idx_;
 
   static __attribute__((always_inline)) inline uint32_t Hash(const void* ptr) {
     uintptr_t h = reinterpret_cast<uintptr_t>(ptr) >> 3;
@@ -159,12 +195,138 @@ class SfiNameTable {
   }
 };
 
+// ── Parameter name string → name index hash table ────────────────────────────
+// Open addressing, linear probing, power-of-2 capacity.
+// Fast path: if the same V8 String object pointer (fast_ptr) was seen before,
+//   return cached id immediately.
+// Slow path: FNV-1a hash of string content + linear probe + memcmp on match.
+// Load factor cap: 70% (count*10 >= cap*7 → grow ×2).
+// Initial capacity: 256.  No deletion.
+class ParamNameTable {
+ public:
+  struct Entry {
+    uint32_t    hash;      // FNV-1a hash; 0 = empty slot
+    uint32_t    id;
+    const void* fast_ptr;  // V8 String pointer for fast path
+    char*       str;       // owned heap copy
+    uint32_t    len;
+    uint32_t    _pad;
+  };  // 32 bytes
+  static_assert(sizeof(Entry) == 32, "ParamNameTable::Entry must be 32 bytes");
+
+  ParamNameTable() : slots_(nullptr), cap_(0), count_(0) {
+    Grow(256);
+  }
+
+  ~ParamNameTable() {
+    for (uint32_t i = 0; i < cap_; i++) {
+      if (slots_[i].hash) free(slots_[i].str);
+    }
+    free(slots_);
+  }
+
+  // Intern a parameter name string.
+  // fast_ptr: V8 String pointer (may be nullptr for positional fallback names).
+  // str/len:  UTF-8 content of the parameter name.
+  // next_id_ptr: shared counter; incremented when a new id is assigned.
+  // is_new: set to true when a new entry is created.
+  // Returns the name_idx for this string.
+  uint32_t Intern(const void* fast_ptr, const char* str, uint32_t len,
+                  uint32_t* next_id_ptr, bool* is_new) {
+    uint32_t h = Hash(str, len);
+
+    // Fast path: pointer hit
+    if (fast_ptr) {
+      uint32_t i = 0;
+      for (;;) {
+        uint32_t s = (h + i++) & (cap_ - 1);
+        if (!slots_[s].hash) break;  // not found via pointer
+        if (slots_[s].fast_ptr == fast_ptr) {
+          *is_new = false;
+          return slots_[s].id;
+        }
+      }
+    }
+
+    // Slow path: content match
+    uint32_t probe = 0;
+    uint32_t insert_slot = UINT32_MAX;
+    for (;;) {
+      uint32_t s = (h + probe++) & (cap_ - 1);
+      if (!slots_[s].hash) {
+        if (insert_slot == UINT32_MAX) insert_slot = s;
+        break;  // not found
+      }
+      if (slots_[s].hash == h && slots_[s].len == len &&
+          memcmp(slots_[s].str, str, len) == 0) {
+        // Found by content — cache the fast_ptr for future hits
+        if (fast_ptr && !slots_[s].fast_ptr) slots_[s].fast_ptr = fast_ptr;
+        *is_new = false;
+        return slots_[s].id;
+      }
+    }
+
+    // Insert new entry
+    uint32_t id = (*next_id_ptr)++;
+    char* copy = static_cast<char*>(malloc(len + 1));
+    memcpy(copy, str, len);
+    copy[len] = '\0';
+    slots_[insert_slot] = {h, id, fast_ptr, copy, len, 0};
+    count_++;
+    *is_new = true;
+
+    // Grow if load factor >= 70%
+    if (count_ * 10 >= cap_ * 7) Grow(cap_ * 2);
+
+    return id;
+  }
+
+  static uint32_t Hash(const char* s, uint32_t len) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < len; i++) {
+      h ^= static_cast<uint8_t>(s[i]);
+      h *= 16777619u;
+    }
+    return h ? h : 1u;  // 0 reserved for empty slot
+  }
+
+ private:
+  Entry*   slots_;
+  uint32_t cap_;
+  uint32_t count_;
+
+  void Grow(uint32_t new_cap) {
+    Entry* ns = static_cast<Entry*>(calloc(new_cap, sizeof(Entry)));
+    for (uint32_t i = 0; i < cap_; i++) {
+      if (!slots_[i].hash) continue;
+      uint32_t probe = 0;
+      for (;;) {
+        uint32_t s = (slots_[i].hash + probe++) & (new_cap - 1);
+        if (!ns[s].hash) { ns[s] = slots_[i]; break; }
+      }
+    }
+    free(slots_);
+    slots_ = ns;
+    cap_ = new_cap;
+  }
+};
+
 class TraceWriter {
  public:
+  // Raw parameter info passed from runtime into WriteFuncEnter.
+  struct RawParamInfo {
+    const void* name_fast_ptr;
+    const char* name_str;
+    uint32_t    name_len;
+    uint8_t     type_tag;
+    uint8_t     _pad[3];
+    uint64_t    value;
+  };
+
   TraceWriter()
       : buf_(nullptr), ptr_(nullptr), buf_end_(nullptr), fd_(-1),
         next_call_id_(0), last_event_ts_(0), max_per_second_(100000),
-        last_flush_ts_(0) {}
+        last_flush_ts_(0), next_name_idx_(0) {}
 
   ~TraceWriter() {
     ForceCloseAbove(-1);
@@ -208,13 +370,33 @@ class TraceWriter {
   // ── Trace event writers — push to stage_, call_stack_ tracked in real-time ──
 
   __attribute__((always_inline)) inline void WriteFuncEnter(
-      const void* sfi_key, const char* name, int name_len, bool is_async) {
+      const void* sfi_key, const char* name, int name_len, bool is_async,
+      const RawParamInfo* params = nullptr, int param_count = 0) {
     uint32_t call_id = next_call_id_++;
     uint32_t idx = EnsureNamed(sfi_key, name, name_len);
-    uint64_t ts = NowNs();
+
+    // Resolve param names (emits NEW_NAME to buf_ for new param names).
+    // This must happen BEFORE pushing the StagedEvent.
+    int pc = (param_count > kMaxParams) ? kMaxParams : param_count;
+    StagedEvent ev;
+    ev.ts = NowNs();
+    ev.name_idx = idx;
+    ev.call_id = call_id;
+    ev.type = kTraceFuncEnter;
+    ev.is_async = (uint8_t)(is_async ? 1 : 0);
+    ev.param_count = (uint8_t)pc;
+
+    for (int i = 0; i < pc; i++) {
+      uint32_t pname_idx = EnsureParamNamed(
+          params[i].name_fast_ptr, params[i].name_str, params[i].name_len);
+      ev.params[i].name_idx = pname_idx;
+      ev.params[i].type_tag = params[i].type_tag;
+      ev.params[i]._pad[0] = ev.params[i]._pad[1] = ev.params[i]._pad[2] = 0;
+      ev.params[i].value = params[i].value;
+    }
+
     call_stack_.push_back({call_id, sfi_key, idx});
-    stage_.push_back({.ts = ts, .name_idx = idx, .call_id = call_id,
-                      .type = kTraceFuncEnter, .is_async = (uint8_t)(is_async ? 1 : 0)});
+    stage_.push_back(ev);
   }
 
   // Pops the top of call_stack_. Ignition always EXITs in LIFO order so no
@@ -224,8 +406,12 @@ class TraceWriter {
     uint32_t call_id  = call_stack_.back().call_id;
     uint32_t name_idx = call_stack_.back().name_idx;
     call_stack_.pop_back();
-    stage_.push_back({.ts = NowNs(), .name_idx = name_idx, .call_id = call_id,
-                      .type = kTraceFuncExit});
+    StagedEvent ev;
+    ev.ts = NowNs();
+    ev.name_idx = name_idx;
+    ev.call_id = call_id;
+    ev.type = kTraceFuncExit;
+    stage_.push_back(ev);
   }
 
   __attribute__((noinline)) void WriteAsyncSuspend(
@@ -234,8 +420,12 @@ class TraceWriter {
     uint32_t call_id  = call_stack_.back().call_id;
     uint32_t name_idx = call_stack_.back().name_idx;
     call_stack_.pop_back();
-    stage_.push_back({.ts = NowNs(), .name_idx = name_idx, .call_id = call_id,
-                      .type = kTraceAsyncSuspend});
+    StagedEvent ev;
+    ev.ts = NowNs();
+    ev.name_idx = name_idx;
+    ev.call_id = call_id;
+    ev.type = kTraceAsyncSuspend;
+    stage_.push_back(ev);
   }
 
   __attribute__((noinline)) void WriteAsyncResume(
@@ -244,8 +434,12 @@ class TraceWriter {
     uint32_t idx = EnsureNamed(sfi_key, name, name_len);
     uint64_t ts = NowNs();
     call_stack_.push_back({call_id, sfi_key, idx});
-    stage_.push_back({.ts = ts, .name_idx = idx, .call_id = call_id,
-                      .type = kTraceAsyncResume});
+    StagedEvent ev;
+    ev.ts = ts;
+    ev.name_idx = idx;
+    ev.call_id = call_id;
+    ev.type = kTraceAsyncResume;
+    stage_.push_back(ev);
   }
 
   __attribute__((noinline)) void WriteOnStackReplacement(
@@ -255,8 +449,12 @@ class TraceWriter {
       uint32_t call_id  = call_stack_.back().call_id;
       uint32_t name_idx = call_stack_.back().name_idx;
       call_stack_.pop_back();
-      stage_.push_back({.ts = NowNs(), .name_idx = name_idx, .call_id = call_id,
-                        .type = kTraceFuncOnStackReplacement});
+      StagedEvent ev;
+      ev.ts = NowNs();
+      ev.name_idx = name_idx;
+      ev.call_id = call_id;
+      ev.type = kTraceFuncOnStackReplacement;
+      stage_.push_back(ev);
       return;
     }
     int idx = FindInStackBySfi(sfi_key);
@@ -270,13 +468,20 @@ class TraceWriter {
     uint32_t call_id  = call_stack_.back().call_id;
     uint32_t name_idx = call_stack_.back().name_idx;
     call_stack_.pop_back();
-    stage_.push_back({.ts = NowNs(), .name_idx = name_idx, .call_id = call_id,
-                      .type = kTraceFuncOnStackReplacement});
+    StagedEvent ev;
+    ev.ts = NowNs();
+    ev.name_idx = name_idx;
+    ev.call_id = call_id;
+    ev.type = kTraceFuncOnStackReplacement;
+    stage_.push_back(ev);
   }
 
   void WriteOptimizedBatch(uint64_t count) {
-    stage_.push_back({.ts = NowNs(), .batch_count = static_cast<uint32_t>(count),
-                      .type = kTraceOptimizedBatch});
+    StagedEvent ev;
+    ev.ts = NowNs();
+    ev.batch_count = static_cast<uint32_t>(count);
+    ev.type = kTraceOptimizedBatch;
+    stage_.push_back(ev);
   }
 
   // ── Buffer I/O ──────────────────────────────────────────────────────────────
@@ -481,7 +686,8 @@ class TraceWriter {
 
     uint32_t call_id = next_call_id_++;
     bool is_new;
-    uint32_t idx = name_table_.Upsert(kKey, &is_new);
+    uint32_t idx = name_table_.Upsert(kKey, &is_new, next_name_idx_);
+    if (is_new) next_name_idx_++;
     EnsureSpace();
     if (is_new) {
       WriteHeader(kTraceNewName, start_ts);
@@ -489,7 +695,7 @@ class TraceWriter {
     }
     EnsureSpace();
     WriteHeader(kTraceFuncEnter, start_ts);
-    W4(idx); W1(0); W4(call_id);
+    W4(idx); W1(0); W4(call_id); W1(0);  // param_count = 0
     EnsureSpace();
     WriteHeader(kTraceFuncExit, end_ts);
     W4(idx); W4(call_id);
@@ -592,7 +798,7 @@ class TraceWriter {
 
   // One entry per event staged for the current 100ms window.
   // NEW_NAME events are emitted directly to buf_ (never staged) so new_name
-  // is not needed here.  24-byte struct fits 2.5× more events per cache line.
+  // is not needed here.
   struct StagedEvent {
     uint64_t       ts          = 0;
     uint32_t       name_idx    = 0;
@@ -600,15 +806,23 @@ class TraceWriter {
     uint32_t       batch_count = 0;
     TraceEventType type        = kTraceFuncEnter;
     uint8_t        is_async    = 0;
-    uint16_t       _pad        = 0;
+    uint8_t        param_count = 0;
+    uint8_t        _pad        = 0;
+    ParamSlot      params[kMaxParams];
   };
-  static_assert(sizeof(StagedEvent) == 24, "StagedEvent must be 24 bytes");
   std::vector<StagedEvent> stage_;
 
   std::vector<std::string> debug_name_strs_;  // idx→name, only populated in strict mode
 
   // ── SFI pointer → name index table ──────────────────────────────────────────
   SfiNameTable name_table_;
+
+  // ── Parameter name string → name index table ────────────────────────────────
+  ParamNameTable param_name_table_;
+
+  // ── Shared monotonically-increasing name index counter ───────────────────────
+  // Used by both name_table_ (SFI names) and param_name_table_ (param names).
+  uint32_t next_name_idx_;
 
   // ── EnsureNamed: assign name_idx, emit NEW_NAME directly to buf_ on first use.
   // NEW_NAME is emitted with ts=last_event_ts_ (zero delta from previous buf_
@@ -617,8 +831,9 @@ class TraceWriter {
   __attribute__((always_inline)) inline uint32_t EnsureNamed(
       const void* sfi_key, const char* name, int name_len) {
     bool is_new;
-    uint32_t idx = name_table_.Upsert(sfi_key, &is_new);
+    uint32_t idx = name_table_.Upsert(sfi_key, &is_new, next_name_idx_);
     if (__builtin_expect(is_new, 0)) {
+      next_name_idx_++;
       if (!name || name_len == 0) { name = "(anonymous)"; name_len = 11; }
       if (StrictMode()) {
         if (idx >= debug_name_strs_.size()) debug_name_strs_.resize(idx + 1);
@@ -629,6 +844,22 @@ class TraceWriter {
       W4(idx);
       W2((uint16_t)name_len);
       WBytes(name, name_len);
+    }
+    return idx;
+  }
+
+  // ── EnsureParamNamed: assign name_idx for a parameter name string.
+  // Emits NEW_NAME directly to buf_ on first use (same timing as EnsureNamed).
+  __attribute__((always_inline)) inline uint32_t EnsureParamNamed(
+      const void* fast_ptr, const char* str, uint32_t len) {
+    bool is_new;
+    uint32_t idx = param_name_table_.Intern(fast_ptr, str, len, &next_name_idx_, &is_new);
+    if (__builtin_expect(is_new, 0)) {
+      EnsureSpace();
+      WriteHeader(kTraceNewName, last_event_ts_);
+      W4(idx);
+      W2((uint16_t)len);
+      WBytes(str, (int)len);
     }
     return idx;
   }
@@ -644,6 +875,13 @@ class TraceWriter {
       case kTraceFuncEnter:
         WriteHeader(kTraceFuncEnter, ev.ts);
         W4(ev.name_idx); W1(ev.is_async); W4(ev.call_id);
+        W1(ev.param_count);
+        for (int i = 0; i < ev.param_count; i++) {
+          const ParamSlot& p = ev.params[i];
+          W4(p.name_idx); W1(p.type_tag);
+          if (p.type_tag == 2 || p.type_tag == 3 || p.type_tag == 4)
+            W8(p.value);
+        }
         break;
       case kTraceFuncExit:
       case kTraceAsyncSuspend:
@@ -678,8 +916,12 @@ class TraceWriter {
     while ((int)call_stack_.size() - 1 > target_idx) {
       const StackFrame f = call_stack_.back();
       call_stack_.pop_back();
-      stage_.push_back({.ts = NowNs(), .name_idx = f.name_idx, .call_id = f.call_id,
-                        .type = kTraceFuncExit});
+      StagedEvent ev;
+      ev.ts = NowNs();
+      ev.name_idx = f.name_idx;
+      ev.call_id = f.call_id;
+      ev.type = kTraceFuncExit;
+      stage_.push_back(ev);
     }
   }
 

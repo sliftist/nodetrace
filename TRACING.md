@@ -95,6 +95,21 @@ Control throttling:
 INSPECT_MAX_PER_SECOND=10000 NODE_TRACE_FILE=my_trace.bin node my_program.js
 ```
 
+### Parameter capture (`NODE_TRACE_PARAMS=1`)
+
+When `NODE_TRACE_PARAMS=1` is set alongside `NODE_TRACE_FILE`, every
+`FUNC_ENTER` event includes up to 10 formal parameters: their interned names
+and their values (type tag + u64 payload for bool/int/float; type-only for
+string/object/etc.).
+
+```
+NODE_TRACE_PARAMS=1 NODE_TRACE_FILE=my_trace.bin node my_program.js
+```
+
+Parameter names are interned the same way as function names — they share the
+same `names[]` array and the same monotonically-increasing index counter.
+`EV_NEWNAME` (0x06) events cover both function and parameter names.
+
 ## Wire format reference
 
 The binary trace is a flat stream of records. Records never cross a flush
@@ -121,7 +136,7 @@ Consecutive events typically differ by < 255 ns, so the delta fits in 1 byte.
 | Value | Name | Fields after header+delta |
 |-------|------|---------------------------|
 | 0x06 | NEW_NAME | name_idx(u32-LE), len(u16-LE), utf-8 bytes |
-| 0x00 | FUNC_ENTER | name_idx(u32-LE), is_async(u8), call_id(u32-LE) |
+| 0x00 | FUNC_ENTER | name_idx(u32-LE), is_async(u8), call_id(u32-LE), param_count(u8), [name_idx(u32-LE), type_tag(u8), value?(u64-LE)] × param_count |
 | 0x01 | FUNC_EXIT | name_idx(u32-LE), call_id(u32-LE) |
 | 0x02 | ASYNC_SUSPEND | name_idx(u32-LE), call_id(u32-LE) |
 | 0x03 | ASYNC_RESUME | name_idx(u32-LE), call_id(u32-LE) |
@@ -131,6 +146,29 @@ Consecutive events typically differ by < 255 ns, so the delta fits in 1 byte.
 **NEW_NAME** assigns a permanent string index. Always emitted immediately before
 the first event that references that `name_idx`; the following event has delta=0.
 `name_idx` values are assigned in order of first appearance (0, 1, 2, …).
+Both function names and parameter names share the same counter and the same
+`names[]` array.
+
+**FUNC_ENTER** always includes `param_count(u8)` (0 when `NODE_TRACE_PARAMS` is
+not set). When `NODE_TRACE_PARAMS=1`, up to 10 params follow: each has a
+`name_idx(u32-LE)` (interned via the same `names[]` array), a `type_tag(u8)`,
+and an optional `value(u64-LE)` present only when `type_tag ∈ {2, 3, 4}`.
+
+Type tag values:
+
+| Tag | Type | Value field |
+|-----|------|-------------|
+| 0 | undefined | (none) |
+| 1 | null | (none) |
+| 2 | boolean | u64: 0=false, 1=true |
+| 3 | integer | u64: sign-extended i32 (only when double == int32 cast) |
+| 4 | float | u64: IEEE-754 double bits |
+| 5 | string | (none) |
+| 6 | object | (none) |
+| 7 | array | (none) |
+| 8 | function | (none) |
+| 9 | symbol | (none) |
+| 10 | bigint | (none) |
 
 **FUNC_ENTER / FUNC_EXIT** bracket a single synchronous call. `call_id` is a
 process-global uint32 counter incremented on every ENTER and RESUME.
@@ -159,7 +197,8 @@ for throttled drops).
 | Event | Size |
 |-------|------|
 | NEW_NAME (len N) | 8+N bytes |
-| ENTER | 11 bytes |
+| ENTER (no params) | 12 bytes |
+| ENTER (k params, all with value) | 12 + 13k bytes |
 | EXIT / SUSPEND / RESUME / ON_STACK_REPLACEMENT | 10 bytes |
 | OPTIMIZED_BATCH | 22 bytes |
 

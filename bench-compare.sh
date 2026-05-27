@@ -136,6 +136,29 @@ done
 
 echo ""
 
+# ── Params mode traces (NODE_TRACE_PARAMS=1) ──────────────────────────────────
+
+echo ""
+echo "══════════════════════════════════════════════════════════════════════"
+echo "  Params mode (NODE_TRACE_PARAMS=1) — overhead and size vs default"
+echo "══════════════════════════════════════════════════════════════════════"
+printf "  %-36s %5s\n" "configuration" "best/${RUNS}"
+echo "  ────────────────────────────────────────────────────────────────────"
+
+f="./bench_overhead_params.bin"
+ms=$(best_ms "NODE_TRACE_PARAMS=1 NODE_TRACE_FILE=$f $PATCHED bench-overhead.js")
+print_row "bench-overhead params" "$ms" "  $(trace_stats "$f")"
+
+f="./zod_params.bin"
+ms=$(best_ms "NODE_TRACE_PARAMS=1 NODE_TRACE_FILE=$f $PATCHED $ZOD_CMD")
+print_row "zod params" "$ms" "  $(trace_stats "$f")"
+
+f="./workload_params.bin"
+ms=$(best_ms "NODE_TRACE_PARAMS=1 NODE_TRACE_FILE=$f $PATCHED workload.js")
+print_row "workload params" "$ms" "  $(trace_stats "$f")"
+
+echo ""
+
 # ── Reference traces (default rate, single run) ────────────────────────────────
 
 echo "Generating reference traces (default rate)..."
