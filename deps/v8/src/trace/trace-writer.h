@@ -96,7 +96,7 @@ enum ParamType : uint8_t {
   kParamUndefined = 0,
   kParamNull      = 1,
   kParamBoolean   = 2,   // value: u64 0 or 1
-  kParamInteger   = 3,   // value: u64 sign-extended i32 (when double == int32 cast)
+  kParamInteger   = 3,   // value: i32 (4 bytes) — the number is an integer fitting in i32
   kParamFloat     = 4,   // value: u64 IEEE-754 bits of the double
   kParamString    = 5,   // no value
   kParamObject    = 6,   // no value
@@ -879,8 +879,10 @@ class TraceWriter {
         for (int i = 0; i < ev.param_count; i++) {
           const ParamSlot& p = ev.params[i];
           W4(p.name_idx); W1(p.type_tag);
-          if (p.type_tag == 2 || p.type_tag == 3 || p.type_tag == 4)
+          if (p.type_tag == 2 || p.type_tag == 4)
             W8(p.value);
+          else if (p.type_tag == 3)
+            W4((uint32_t)(int32_t)(int64_t)p.value);  // i32, 4 bytes
         }
         break;
       case kTraceFuncExit:

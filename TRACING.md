@@ -152,7 +152,7 @@ Both function names and parameter names share the same counter and the same
 **FUNC_ENTER** always includes `param_count(u8)` (0 when `NODE_TRACE_PARAMS` is
 not set). When `NODE_TRACE_PARAMS=1`, up to 10 params follow: each has a
 `name_idx(u32-LE)` (interned via the same `names[]` array), a `type_tag(u8)`,
-and an optional `value(u64-LE)` present only when `type_tag ∈ {2, 3, 4}`.
+and an optional value present only when `type_tag ∈ {2, 3, 4}`.
 
 Type tag values:
 
@@ -160,9 +160,9 @@ Type tag values:
 |-----|------|-------------|
 | 0 | undefined | (none) |
 | 1 | null | (none) |
-| 2 | boolean | u64: 0=false, 1=true |
-| 3 | integer | u64: sign-extended i32 (only when double == int32 cast) |
-| 4 | float | u64: IEEE-754 double bits |
+| 2 | boolean | u64-LE: 0=false, 1=true |
+| 3 | integer | i32-LE (4 bytes) — the number is an integer that fits in i32 |
+| 4 | float | u64-LE: IEEE-754 double bits |
 | 5 | string | (none) |
 | 6 | object | (none) |
 | 7 | array | (none) |

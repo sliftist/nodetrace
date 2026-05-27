@@ -85,7 +85,9 @@ function readTrace(buf) {
         const nameIdx = u32();
         const pname   = names[nameIdx] ?? `arg${i}`;
         const tag     = u8();
-        const value   = (tag === 2 || tag === 3 || tag === 4) ? u64() : undefined;
+        const value   = (tag === 2 || tag === 4) ? u64()
+                      : tag === 3 ? buf.readInt32LE((pos += 4) - 4)
+                      : undefined;
         params.push({ name: pname, tag, value });
       }
       events.push({ type: 'ENTER', ts, func, isAsync: !!isAsync, callId, params });
