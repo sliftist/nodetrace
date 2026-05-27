@@ -39,15 +39,14 @@ best_ms() {
 
 trace_stats() {
   local bin="$1"
-  local sz decoded enter batched
+  local sz enter batched
   sz=$(( $(stat -c%s "$bin") / 1024 ))
   local reader_out
-  reader_out=$(node trace-reader.js "$bin" 2>&1)
-  decoded=$(echo "$reader_out" | grep "^Decoded"          | grep -oP '[\d,]+'   | tr -d ',' | head -1)
-  enter=$(  echo "$reader_out" | grep "Ignition calls"    | grep -oP '[\d,]+'   | tr -d ',' | head -1)
-  batched=$(echo "$reader_out" | grep "Optimized calls"   | grep -oP '[\d,]+'   | tr -d ',' | head -1)
-  printf "%6dKB  events=%-9s enter=%-10s batched=%s" \
-    "$sz" "${decoded:-?}" "${enter:-?}" "${batched:-?}"
+  reader_out=$(node analyze-trace.js "$bin" 2>&1)
+  enter=$(  echo "$reader_out" | grep "Total Ignition calls"      | grep -oP '[\d,]+' | tr -d ',' | head -1)
+  batched=$(echo "$reader_out" | grep "Optimized calls (batched)" | grep -oP '[\d,]+' | tr -d ',' | head -1)
+  printf "%6dKB  enter=%-10s batched=%s" \
+    "$sz" "${enter:-?}" "${batched:-?}"
 }
 
 print_row() {
@@ -136,42 +135,84 @@ done
 
 echo ""
 
-# ── Params mode traces (NODE_TRACE_PARAMS=1) ──────────────────────────────────
+# ── Params mode: bench-overhead.js ────────────────────────────────────────────
 
 echo ""
 echo "══════════════════════════════════════════════════════════════════════"
-echo "  Params mode (NODE_TRACE_PARAMS=1) — overhead and size vs default"
+echo "  bench-overhead.js  +params (NODE_TRACE_PARAMS=1)"
 echo "══════════════════════════════════════════════════════════════════════"
-printf "  %-36s %5s\n" "configuration" "best/${RUNS}"
+printf "  %-32s %5s\n" "configuration" "best/${RUNS}"
 echo "  ────────────────────────────────────────────────────────────────────"
 
 f="./bench_overhead_params.bin"
 ms=$(best_ms "NODE_TRACE_PARAMS=1 NODE_TRACE_FILE=$f $PATCHED bench-overhead.js")
-print_row "bench-overhead params" "$ms" "  $(trace_stats "$f")"
+print_row "params (default)" "$ms" "  $(trace_stats "$f")"
+
+for lim in 1000 10000 100000 1000000; do
+  f="./bench_overhead_${lim}_params.bin"
+  ms=$(best_ms "NODE_TRACE_PARAMS=1 INSPECT_MAX_PER_SECOND=$lim NODE_TRACE_FILE=$f $PATCHED bench-overhead.js")
+  print_row "params ${lim}/sec" "$ms" "  $(trace_stats "$f")"
+done
+
+# ── Params mode: zod tsc ───────────────────────────────────────────────────────
+
+echo ""
+echo "══════════════════════════════════════════════════════════════════════"
+echo "  zod tsc  +params (NODE_TRACE_PARAMS=1)"
+echo "══════════════════════════════════════════════════════════════════════"
+printf "  %-32s %5s\n" "configuration" "best/${RUNS}"
+echo "  ────────────────────────────────────────────────────────────────────"
+
+rm -rf ~/.cache/node/compile-cache 2>/dev/null || true
 
 f="./zod_params.bin"
 ms=$(best_ms "NODE_TRACE_PARAMS=1 NODE_TRACE_FILE=$f $PATCHED $ZOD_CMD")
-print_row "zod params" "$ms" "  $(trace_stats "$f")"
+print_row "params (default)" "$ms" "  $(trace_stats "$f")"
+
+for lim in 1000 10000 100000; do   # skip 1000000: file would exceed 100MB
+  f="./zod_${lim}_params.bin"
+  ms=$(best_ms "NODE_TRACE_PARAMS=1 INSPECT_MAX_PER_SECOND=$lim NODE_TRACE_FILE=$f $PATCHED $ZOD_CMD")
+  print_row "params ${lim}/sec" "$ms" "  $(trace_stats "$f")"
+done
+
+# ── Params mode: workload.js ───────────────────────────────────────────────────
+
+echo ""
+echo "══════════════════════════════════════════════════════════════════════"
+echo "  workload.js  +params (NODE_TRACE_PARAMS=1)"
+echo "══════════════════════════════════════════════════════════════════════"
+printf "  %-32s %5s\n" "configuration" "best/${RUNS}"
+echo "  ────────────────────────────────────────────────────────────────────"
 
 f="./workload_params.bin"
 ms=$(best_ms "NODE_TRACE_PARAMS=1 NODE_TRACE_FILE=$f $PATCHED workload.js")
-print_row "workload params" "$ms" "  $(trace_stats "$f")"
+print_row "params (default)" "$ms" "  $(trace_stats "$f")"
+
+for lim in 1000 10000 100000 1000000; do
+  f="./workload_${lim}_params.bin"
+  ms=$(best_ms "NODE_TRACE_PARAMS=1 INSPECT_MAX_PER_SECOND=$lim NODE_TRACE_FILE=$f $PATCHED workload.js")
+  print_row "params ${lim}/sec" "$ms" "  $(trace_stats "$f")"
+done
 
 echo ""
 
 # ── Reference traces (default rate, single run) ────────────────────────────────
 
 echo "Generating reference traces (default rate)..."
-NODE_TRACE_FILE=./small_trace.bin $PATCHED -e "
-'use strict';
+SMALL_INLINE="'use strict';
 function add(a, b) { return a + b; }
 function mul(a, b) { return a * b; }
 function compute(x) { return add(mul(x, 3), mul(x, 7)); }
 let acc = 0;
-for (let i = 0; i < 500; i++) acc = compute(acc & 0xff);
-" >/dev/null 2>&1
-NODE_TRACE_FILE=./large_trace.bin $PATCHED gen-large-trace.js >/dev/null 2>&1
-echo "  small_trace.bin  $(trace_stats ./small_trace.bin)"
-echo "  large_trace.bin  $(trace_stats ./large_trace.bin)"
+for (let i = 0; i < 500; i++) acc = compute(acc & 0xff);"
+
+NODE_TRACE_FILE=./small_trace.bin       $PATCHED -e "$SMALL_INLINE" >/dev/null 2>&1
+NODE_TRACE_FILE=./large_trace.bin       $PATCHED gen-large-trace.js >/dev/null 2>&1
+NODE_TRACE_PARAMS=1 NODE_TRACE_FILE=./small_trace_params.bin $PATCHED -e "$SMALL_INLINE" >/dev/null 2>&1
+NODE_TRACE_PARAMS=1 NODE_TRACE_FILE=./large_trace_params.bin $PATCHED gen-large-trace.js >/dev/null 2>&1
+echo "  small_trace.bin         $(trace_stats ./small_trace.bin)"
+echo "  small_trace_params.bin  $(trace_stats ./small_trace_params.bin)"
+echo "  large_trace.bin         $(trace_stats ./large_trace.bin)"
+echo "  large_trace_params.bin  $(trace_stats ./large_trace_params.bin)"
 
 echo ""
