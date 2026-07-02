@@ -3,16 +3,6 @@ name: Windows build (node.exe)
 on:
   push:
     branches: [main]
-    paths:
-      - 'deps/v8/**'
-      - 'src/**'
-      - 'lib/**'
-      - 'node.gyp'
-      - 'node.gypi'
-      - 'common.gypi'
-      - 'vcbuild.bat'
-      - 'configure.py'
-      - '.github/workflows/windows-build.yml'
   workflow_dispatch: {}
 
 concurrency:
