@@ -1842,6 +1842,42 @@ static void TraceMetaCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
   g_trace_writer->WriteMeta(g_trace_writer->TopCallId(), key_idx, tag, payload);
 }
 
+// process.setFunctionBoost(funcName, level)
+//   level: 0 = normal (respect global throttle),
+//          1 = always keep calls to this function,
+//          2 = always keep calls to this function AND every nested call
+//              made under it (subtree boost).
+// Returns true when tracing is enabled and the boost was applied.
+static void SetFunctionBoostCallback(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  if (!g_trace_writer) return;
+  if (info.Length() < 1) return;
+  v8::Isolate* iso = info.GetIsolate();
+  v8::HandleScope hs(iso);
+  v8::Local<v8::Context> ctx = iso->GetCurrentContext();
+
+  v8::Local<v8::String> name_str;
+  if (!info[0]->ToString(ctx).ToLocal(&name_str)) return;
+  v8::String::Utf8Value name_utf8(iso, name_str);
+  if (!*name_utf8 || name_utf8.length() <= 0) return;
+  uint32_t name_len = name_utf8.length() > 65535 ? 65535
+                                                 : (uint32_t)name_utf8.length();
+
+  uint8_t level = 1;
+  if (info.Length() >= 2 && info[1]->IsNumber()) {
+    double d = info[1].As<v8::Number>()->Value();
+    int32_t i = static_cast<int32_t>(d);
+    if (i < 0) i = 0; else if (i > 2) i = 2;
+    level = static_cast<uint8_t>(i);
+  }
+
+  uint32_t name_idx = g_trace_writer->LookupOrInternNameIdx(
+      static_cast<const void*>(*name_str), *name_utf8, name_len);
+  if (level == 0) g_trace_writer->ClearBoostByNameIdx(name_idx);
+  else            g_trace_writer->SetBoostByNameIdx(name_idx, level == 2);
+  info.GetReturnValue().Set(true);
+}
+
 // Emit a OPTIMIZED_BATCH event if any TurboFan calls accumulated since the
 // last Ignition event.  Call this before every Write* on g_trace_writer.
 static inline void DrainOptimizedCount() {
@@ -1894,6 +1930,7 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
           info.GetReturnValue().Set(nodetrace::ForceResync());
         });
         set_fn("traceMeta", TraceMetaCallback);
+        set_fn("setFunctionBoost", SetFunctionBoostCallback);
       }
     }
   }

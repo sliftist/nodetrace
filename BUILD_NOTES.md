@@ -89,3 +89,31 @@ CPU column shows you'd be burning more total work for a worse wall time.
   memory limit.
 - **Splitting V8's runtime.h** or other widely-included headers: the real
   fix for "worst-case incremental" pain, but invasive.
+
+## Windows build
+
+Cross-compiling Node.js from Linux to Windows is not supported upstream.
+Attempted paths and the reason each failed on this box:
+
+- **clang-cl + xwin sysroot** (`xwin splat` → `/root/winsdk/root`): the
+  compiler and Windows SDK headers/libs are in place, but Node's
+  `configure.py --dest-os=win` calls into `gyp/msvs_emulation.py` which
+  probes for an actual Visual Studio install
+  (`Could not locate Visual Studio installation`). Would require
+  invasive GYP patches to fake the VS registry/env.
+- **msvc-wine** (`/root/msvc-wine/msvc/`): full MSVC + MSBuild running
+  under Wine; the toolchain executes correctly, but the Linux
+  `configure.py` still can't detect it, and running `vcbuild.bat` under
+  Wine fails because it re-invokes `python configure.py` inside the
+  Wine env, which needs Windows Python and a native VS.
+
+The practical route is a **windows-2022 GitHub Actions runner** that
+executes the canonical `vcbuild.bat`. See
+`.github/workflows/windows-build.yml`. On every push to `main`, or via
+`workflow_dispatch`, the workflow builds `node.exe` and publishes it as
+a GitHub Release artifact tagged `windows-build-<sha>`.
+
+To download the latest Windows build:
+1. Go to https://github.com/sliftist/nodetrace/releases (or
+   https://github.com/sliftist/nodetrace/actions for older artifacts).
+2. Download `node-windows-x64` → `node.exe`.

@@ -367,6 +367,38 @@ class TraceWriter {
         next_call_id_(0), last_event_ts_(0), max_per_second_(100000),
         last_flush_ts_(0), next_name_idx_(0) {}
 
+  // ── Server-driven per-function throttle boosts ─────────────────────────────
+  // A "boost" for a function tells the throttle pass to always keep calls to
+  // that function (they bypass the min_duration threshold).  A "nested boost"
+  // additionally keeps every child call transitively while executing inside a
+  // boosted call.  Both are addressed by name_idx (assigned in-process when
+  // the function is first seen); the runtime layer resolves a name string to
+  // a name_idx via LookupNameIdx / MarkBoostByName.
+
+  void SetBoostByNameIdx(uint32_t name_idx, bool nested) {
+    if (name_idx >= boost_.size()) boost_.resize(name_idx + 1, 0);
+    boost_[name_idx] = nested ? 2 : 1;   // 1 = keep this call; 2 = keep + subtree
+  }
+
+  void ClearBoostByNameIdx(uint32_t name_idx) {
+    if (name_idx < boost_.size()) boost_[name_idx] = 0;
+  }
+
+  // Look up a name_idx assigned to a function name.  Returns UINT32_MAX when
+  // the name has never been observed (in which case the caller should stash
+  // the request and retry when the function first appears — for simplicity we
+  // just eagerly assign an id via InternString instead).
+  uint32_t LookupOrInternNameIdx(const void* fast_ptr, const char* str, uint32_t len) {
+    return InternString(fast_ptr, str, len);
+  }
+
+  bool IsBoosted(uint32_t name_idx) const {
+    return name_idx < boost_.size() && boost_[name_idx] != 0;
+  }
+  bool IsNestedBoosted(uint32_t name_idx) const {
+    return name_idx < boost_.size() && boost_[name_idx] == 2;
+  }
+
   ~TraceWriter() {
     ForceCloseAbove(-1);
     FlushStage();
@@ -693,7 +725,19 @@ class TraceWriter {
     FlushStkReset();
     for (const auto& e : stage_) {
       if (e.type == kTraceFuncEnter || e.type == kTraceAsyncResume) {
-        FlushStkPush(e.call_id, e.ts);
+        // Inherit "under nested-boost" from the enclosing frame; upgrade if
+        // this call itself has a nested boost.
+        uint8_t inherited = (flush_stk_top_ > 0)
+                              ? flush_stk_[flush_stk_top_ - 1].subtree_boost : 0;
+        uint8_t this_subtree = inherited || IsNestedBoosted(e.name_idx);
+        FlushStkPush(e.call_id, e.ts, this_subtree);
+        // Apply per-name boost immediately: if we're under a nested boost or
+        // this function has any keep boost, mark it kept and never let the
+        // exit's duration check undo that.
+        if (this_subtree || IsBoosted(e.name_idx)) {
+          if (e.call_id >= min_id && e.call_id <= max_id)
+            bm[e.call_id - min_id] = 1;
+        }
       } else if (e.type == kTraceFuncExit || e.type == kTraceAsyncSuspend ||
                  e.type == kTraceFuncOnStackReplacement) {
         int idx = FlushStkFind(e.call_id);
@@ -705,8 +749,12 @@ class TraceWriter {
           // Entries above idx were interrupted by this exit: always keep them.
           for (int i = idx + 1; i < flush_stk_top_; i++)
             bm[flush_stk_[i].call_id - min_id] = 1;
+          // If a boost already marked this call kept in Pass 2 above (e.g. from
+          // nested-boost inheritance), don't let duration undo it.
+          uint8_t already_kept = (e.call_id >= min_id && e.call_id <= max_id)
+                                     ? bm[e.call_id - min_id] : 0;
           uint64_t dur = e.ts - flush_stk_[idx].ts;
-          bm[e.call_id - min_id] = (dur >= min_duration) ? 1 : 0;
+          bm[e.call_id - min_id] = (already_kept || dur >= min_duration) ? 1 : 0;
           flush_stk_top_ = idx;  // pop match + everything above
         }
       }
@@ -867,20 +915,22 @@ class TraceWriter {
   uint64_t last_flush_ts_;
 
   // ── Flush-pass stack (preserved across flushes to avoid repeated malloc) ────
-  struct FlushStkE { uint32_t call_id; uint64_t ts; };
+  //   subtree_boost: 1 iff any enclosing frame in the stack (or this frame)
+  //   has a nested boost active; propagates down until that frame pops.
+  struct FlushStkE { uint32_t call_id; uint64_t ts; uint8_t subtree_boost; };
   FlushStkE* flush_stk_     = nullptr;
   int        flush_stk_top_ = 0;
   int        flush_stk_cap_ = 0;
 
   void FlushStkReset() { flush_stk_top_ = 0; }
 
-  void FlushStkPush(uint32_t id, uint64_t ts) {
+  void FlushStkPush(uint32_t id, uint64_t ts, uint8_t subtree_boost = 0) {
     if (flush_stk_top_ == flush_stk_cap_) {
       flush_stk_cap_ = flush_stk_cap_ ? flush_stk_cap_ * 2 : 64;
       flush_stk_ = static_cast<FlushStkE*>(
           realloc(flush_stk_, flush_stk_cap_ * sizeof(FlushStkE)));
     }
-    flush_stk_[flush_stk_top_++] = {id, ts};
+    flush_stk_[flush_stk_top_++] = {id, ts, subtree_boost};
   }
 
   int FlushStkFind(uint32_t id) const {
@@ -892,6 +942,11 @@ class TraceWriter {
   // ── Keep bitmap (preserved across flushes up to 16 MB) ──────────────────────
   uint8_t* keep_bm_     = nullptr;
   uint32_t keep_bm_cap_ = 0;
+
+  // ── Per-function keep-boost table (see SetBoostByNameIdx) ───────────────────
+  // 0 = normal (subject to throttle); 1 = always keep this call; 2 = always
+  // keep this call and all nested calls made from it.  Indexed by name_idx.
+  std::vector<uint8_t> boost_;
 
   struct StackFrame {
     uint32_t    call_id;
