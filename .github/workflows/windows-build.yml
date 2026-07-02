@@ -1,0 +1,76 @@
+name: Windows build (node.exe)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deps/v8/**'
+      - 'src/**'
+      - 'lib/**'
+      - 'node.gyp'
+      - 'node.gypi'
+      - 'common.gypi'
+      - 'vcbuild.bat'
+      - 'configure.py'
+      - '.github/workflows/windows-build.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: windows-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Show environment
+        shell: cmd
+        run: |
+          set
+          where cl.exe
+          where MSBuild.exe
+
+      - name: Build node.exe (Release, x64, no-intl)
+        shell: cmd
+        run: |
+          call vcbuild.bat release x64 no-cctest no-cctest-junit no-etw enable-static ninja
+        env:
+          NODEJS_MAKE_PARALLEL_JOBS: '4'
+
+      - name: Locate node.exe
+        id: locate
+        shell: powershell
+        run: |
+          $exe = Get-ChildItem -Path . -Filter node.exe -Recurse -File | Select-Object -First 1
+          if (-not $exe) { throw "node.exe not built" }
+          "path=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Built: $($exe.FullName)  ($([math]::Round($exe.Length/1MB,1)) MB)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-windows-x64
+          path: ${{ steps.locate.outputs.path }}
+          if-no-files-found: error
+
+      - name: Publish release (main only)
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-build-${{ github.sha }}
+          name: Windows build (commit ${{ github.sha }})
+          files: ${{ steps.locate.outputs.path }}
+          body: |
+            Auto-built node.exe for the nodetrace fork.
+            Commit: ${{ github.sha }}
+            Config: release x64 (no-intl)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

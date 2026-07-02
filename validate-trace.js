@@ -4,9 +4,10 @@ const { readTrace } = require('./trace-parser');
 
 function validate(events, logPath) {
   const stack = [];  // [{ callId, func }]
+  const seenAsRoot = new Set();
   let errors = 0;
-  let enters = 0, exits = 0, suspends = 0, resumes = 0, osrs = 0;
-  let orphanEnds = 0, wrongOrderEnds = 0;
+  let enters = 0, exits = 0, suspends = 0, resumes = 0, osrs = 0, metas = 0;
+  let orphanEnds = 0, wrongOrderEnds = 0, badParents = 0, orphanMetas = 0;
   let maxDepth = 0, maxDepthStack = [];
 
   const endEvent = (ev) => {
@@ -40,9 +41,33 @@ function validate(events, logPath) {
     }
   };
 
+  const checkParent = (ev) => {
+    if (ev.parentId === null || ev.parentId === undefined) {
+      // Root — legal only when the writer's stack is empty.
+      if (stack.length !== 0) {
+        badParents++;
+        if (badParents <= 5)
+          console.error(`ERROR: ${ev.type} callId=${ev.callId} func=${ev.func} claims root but stack depth ${stack.length}`);
+        errors++;
+      }
+      seenAsRoot.add(ev.callId);
+      return;
+    }
+    const top = stack.length ? stack[stack.length - 1] : null;
+    if (!top || top.callId !== ev.parentId) {
+      badParents++;
+      if (badParents <= 5) {
+        console.error(`ERROR: ${ev.type} callId=${ev.callId} func=${ev.func} parentId=${ev.parentId} ` +
+          `does not match stack top ${top ? `(${top.callId})` : '(empty)'}`);
+      }
+      errors++;
+    }
+  };
+
   for (const ev of events) {
     if (ev.type === 'ENTER') {
       enters++;
+      checkParent(ev);
       stack.push({ callId: ev.callId, func: ev.func });
       trackDepth();
     } else if (ev.type === 'EXIT') {
@@ -53,11 +78,19 @@ function validate(events, logPath) {
       if (endEvent(ev)) stack.pop();
     } else if (ev.type === 'RESUME') {
       resumes++;
+      checkParent(ev);
       stack.push({ callId: ev.callId, func: ev.func });
       trackDepth();
     } else if (ev.type === 'ON_STACK_REPLACEMENT') {
       osrs++;
       if (endEvent(ev)) stack.pop();
+    } else if (ev.type === 'META') {
+      metas++;
+      if (ev.holderId !== null && !stack.some(f => f.callId === ev.holderId)) {
+        // META whose holder isn't currently on the stack — permitted (holder
+        // may have been throttled out) but we count it for diagnostics.
+        orphanMetas++;
+      }
     }
   }
 
@@ -76,7 +109,10 @@ function validate(events, logPath) {
   ];
   fs.writeFileSync(logPath, lines.join('\n') + '\n');
 
-  return { errors, enters, exits, suspends, resumes, osrs, orphanEnds, wrongOrderEnds };
+  return {
+    errors, enters, exits, suspends, resumes, osrs, metas,
+    orphanEnds, wrongOrderEnds, badParents, orphanMetas,
+  };
 }
 
 const path = process.argv[2];
@@ -87,14 +123,19 @@ const buf = fs.readFileSync(path);
 console.log(`Validating ${path} (${(buf.length / 1e6).toFixed(1)} MB)...`);
 
 const { events } = readTrace(buf);
-const { errors, enters, exits, suspends, resumes, osrs, orphanEnds, wrongOrderEnds } = validate(events, logPath);
+const r = validate(events, logPath);
 
-console.log(`  ENTER=${enters.toLocaleString()}  EXIT=${exits.toLocaleString()}  SUSPEND=${suspends.toLocaleString()}  RESUME=${resumes.toLocaleString()}  OSR=${osrs.toLocaleString()}`);
-console.log(`  orphan-ends (no start)=${orphanEnds.toLocaleString()}  wrong-order-ends (start buried)=${wrongOrderEnds.toLocaleString()}`);
+console.log(`  ENTER=${r.enters.toLocaleString()}  EXIT=${r.exits.toLocaleString()}  ` +
+            `SUSPEND=${r.suspends.toLocaleString()}  RESUME=${r.resumes.toLocaleString()}  ` +
+            `OSR=${r.osrs.toLocaleString()}  META=${r.metas.toLocaleString()}`);
+console.log(`  orphan-ends=${r.orphanEnds.toLocaleString()}  ` +
+            `wrong-order-ends=${r.wrongOrderEnds.toLocaleString()}  ` +
+            `bad-parents=${r.badParents.toLocaleString()}  ` +
+            `orphan-metas=${r.orphanMetas.toLocaleString()}`);
 console.log(`  Max stack depth logged to: ${logPath}`);
-if (errors === 0) {
+if (r.errors === 0) {
   console.log(`  OK — no ordering errors found`);
 } else {
-  console.log(`  FAILED — ${errors} error(s) found`);
+  console.log(`  FAILED — ${r.errors} error(s) found`);
   process.exit(1);
 }

@@ -10,9 +10,16 @@
 #include <unistd.h>
 #include <time.h>
 
-// ── Binary trace format ───────────────────────────────────────────────────────
+// ── Binary trace format v2 (parent-ref) ─────────────────────────────────────
 //
-// Flat stream of records, back-to-back.  Records never cross a flush boundary.
+// FILE HEADER (v2, 8 bytes at offset 0):
+//   [4]  magic   = "NTRC"
+//   [2]  version = 0x0002 (LE)
+//   [2]  flags   (LE)  bit 0: params captured (NODE_TRACE_PARAMS=1)
+//                      bits 1-15: reserved (0)
+//
+// Then a flat stream of records, back-to-back.  Records never cross a flush
+// boundary.
 //
 // RECORD:
 //   [uint8]  header  =  ss:2 | type:6
@@ -22,18 +29,26 @@
 //            absolute ts = running sum of all deltas since t=0
 //   [fields] fixed layout determined by type — no per-field tags
 //
+// PARENT REFERENCE MODEL
+//   Every ENTER / ASYNC_RESUME event carries the call_id of its parent (the
+//   call_id of the enclosing frame that was on top of the stack at the moment
+//   the child was entered).  0xFFFFFFFF = no parent (root frame).  Consumers
+//   reconstruct the tree by joining child.parent_id → parent.call_id.  The
+//   internal writer still maintains a LIFO stack for EXIT matching; the
+//   parent_id is captured off the stack top at ENTER/RESUME time.
+//
 // EVENT TYPES (type field, bottom 6 bits of header):
 //
 //   START events — each has a matching END identified by call_id:
-//   0x00  FUNC_ENTER    name_idx(u32-LE), is_async(u8), call_id(u32-LE),
-//                       param_count(u8),
+//   0x00  FUNC_ENTER    name_idx(u32-LE), parent_id(u32-LE), is_async(u8),
+//                       call_id(u32-LE), param_count(u8),
 //                       [name_idx(u32-LE), type_tag(u8),
 //                        value(u64-LE) — only if type_tag ∈ {2,3,4}] × param_count
 //         param_count is always written (0 when NODE_TRACE_PARAMS not set).
 //         type_tag values:
 //           0=undefined  1=null    2=boolean  3=integer  4=float
 //           5=string     6=object  7=array    8=function 9=symbol  10=bigint
-//   0x03  ASYNC_RESUME  name_idx(u32-LE), call_id(u32-LE)
+//   0x03  ASYNC_RESUME  name_idx(u32-LE), parent_id(u32-LE), call_id(u32-LE)
 //
 //   END events — matched to their START by call_id:
 //   0x01  FUNC_EXIT     name_idx(u32-LE), call_id(u32-LE)
@@ -50,11 +65,23 @@
 //            max_ts: latest ns-since-epoch ts of any dropped call EXIT.
 //            For JIT batches (single ts known): min_ts = max_ts = ts.
 //   0x06  NEW_NAME      name_idx(u32-LE), len(u16-LE), utf-8 bytes
-//            Assigns a permanent index to a function or parameter name.
-//            Always emitted before the first call event that references that
-//            name_idx.  The following call event has delta=0 (same timestamp).
-//            Both function names and parameter names share the same counter and
-//            the same JS names[] array.
+//            Assigns a permanent index to a function or parameter name, a
+//            metadata key, or an interned string metadata value.
+//            Always emitted before the first record that references that
+//            name_idx.  The following event has delta=0 (same timestamp).
+//   0x07  META          holder_id(u32-LE), key_name_idx(u32-LE),
+//                       type_tag(u8),
+//                       payload — depending on type_tag:
+//                         2 boolean  → u64-LE (0 or 1)
+//                         3 integer  → i32-LE (4 bytes)
+//                         4 float    → u64-LE (IEEE-754 bits)
+//                         5 string   → u32-LE (name_idx of interned value)
+//                         others (0/1/6/7/8/9/10) → no payload
+//         Attaches a key/value pair to an existing call.  holder_id references
+//         the call_id of the call the metadata belongs to (typically the
+//         currently-executing call at the moment process.traceMeta(...) was
+//         called).  holder_id = 0xFFFFFFFF is legal and means "no holder"
+//         (e.g. traceMeta invoked at module top-level before any ENTER).
 //
 // name_idx is assigned in order of first appearance (0, 1, 2, ...).
 // The reader maintains a flat array: names[name_idx] = string.
@@ -69,18 +96,20 @@
 // Throttling (INSPECT_MAX_PER_SECOND, default 100 000):
 //   Events are staged until a libuv timer fires (every ~100 ms), then filtered.
 //   Calls shorter than a computed duration threshold are dropped and folded into
-//   OPTIMIZED_BATCH along with any JIT-compiled calls.
-//   The threshold is derived by exponential-bucket histogram so that the
-//   surviving call count ≈ max_per_second × elapsed_seconds per flush window.
-//   A synthetic FUNC_ENTER / FUNC_EXIT pair named "(trace-flush)" wraps each
-//   flush period, showing exactly how long the filter pass took.
+//   OPTIMIZED_BATCH along with any JIT-compiled calls.  META events are always
+//   kept (dropping a META because its holder was throttled would silently lose
+//   the annotation; leaving META with a now-orphan holder_id lets the consumer
+//   surface that the annotation happened even if we don't have the call frame).
 //
 // Approximate record sizes (delta fits in 1 byte — typical between events):
 //   NEW_NAME (len N):                     1 + 1 + 4 + 2 + N = 8+N bytes
-//   ENTER (no params):                    1 + 1 + 4 + 1 + 4 + 1 = 12 bytes
-//   ENTER (k params, all with value):     12 + k*(4+1+8) = 12+13k bytes
-//   EXIT/SUSPEND/RESUME/ON_STACK_REPLACEMENT: 1 + 1 + 4 + 4 = 10 bytes
+//   ENTER (no params):                    1 + 1 + 4 + 4 + 1 + 4 + 1 = 16 bytes
+//   ENTER (k params, all with value):     16 + k*(4+1+8) = 16+13k bytes
+//   RESUME:                               1 + 1 + 4 + 4 + 4 = 14 bytes
+//   EXIT/SUSPEND/ON_STACK_REPLACEMENT:    1 + 1 + 4 + 4 = 10 bytes
 //   OPTIMIZED_BATCH:                      1 + 1 + 4 + 8 + 8 = 22 bytes
+//   META (no payload):                    1 + 1 + 4 + 4 + 1 = 11 bytes
+//   META (u64 payload):                   19 bytes
 
 namespace v8 {
 namespace internal {
@@ -126,7 +155,17 @@ enum TraceEventType : uint8_t {
   // Bookkeeping (no call_id):
   kTraceOptimizedBatch         = 0x05,
   kTraceNewName                = 0x06,
+  kTraceMeta                   = 0x07,
 };
+
+// Sentinel used in parent_id / holder_id fields to mean "no parent" (a root
+// call) or "no holder" (metadata emitted outside any JS call frame).
+static constexpr uint32_t kNoCallId = UINT32_MAX;
+
+// Binary trace file magic + version.  Emitted once at offset 0.
+static constexpr uint8_t  kFileMagic[4] = {'N', 'T', 'R', 'C'};
+static constexpr uint16_t kFileVersion  = 2;
+static constexpr uint16_t kFileFlagParams = 0x0001;
 
 // ── SFI pointer → name index hash table ──────────────────────────────────────
 // Open addressing, linear probing.  Load factor capped at 1/4.
@@ -352,7 +391,39 @@ class TraceWriter {
       uint64_t v = strtoull(mps, nullptr, 10);
       if (v > 0 && v <= UINT32_MAX) max_per_second_ = static_cast<uint32_t>(v);
     }
+
+    // File header: magic + version + flags.  Emitted before any records so the
+    // reader can detect version and whether params are present.
+    uint16_t flags = 0;
+    if (getenv("NODE_TRACE_PARAMS") != nullptr) flags |= kFileFlagParams;
+    memcpy(ptr_, kFileMagic, 4); ptr_ += 4;
+    ptr_[0] = (uint8_t)(kFileVersion);       ptr_[1] = (uint8_t)(kFileVersion >> 8);
+    ptr_[2] = (uint8_t)(flags);              ptr_[3] = (uint8_t)(flags >> 8);
+    ptr_ += 4;
     return true;
+  }
+
+  // Returns the call_id at the top of the currently-executing stack (used by
+  // process.traceMeta to attach metadata to the current frame).  kNoCallId when
+  // the stack is empty (module top-level / native code).
+  __attribute__((always_inline)) inline uint32_t TopCallId() const {
+    return call_stack_.empty() ? kNoCallId : call_stack_.back().call_id;
+  }
+
+  // Intern a metadata key or string-typed metadata value.  Emits NEW_NAME
+  // directly to buf_ on first use.  Returns the name_idx.
+  __attribute__((always_inline)) inline uint32_t InternString(
+      const void* fast_ptr, const char* str, uint32_t len) {
+    bool is_new;
+    uint32_t idx = param_name_table_.Intern(fast_ptr, str, len, &next_name_idx_, &is_new);
+    if (__builtin_expect(is_new, 0)) {
+      EnsureSpace();
+      WriteHeader(kTraceNewName, last_event_ts_);
+      W4(idx);
+      W2((uint16_t)len);
+      WBytes(str, (int)len);
+    }
+    return idx;
   }
 
   // Returns true if this SFI pointer has already been assigned a name index.
@@ -373,6 +444,9 @@ class TraceWriter {
       const void* sfi_key, const char* name, int name_len, bool is_async,
       const RawParamInfo* params = nullptr, int param_count = 0) {
     uint32_t call_id = next_call_id_++;
+    uint32_t parent_id = call_stack_.empty()
+                             ? kNoCallId
+                             : call_stack_.back().call_id;
     uint32_t idx = EnsureNamed(sfi_key, name, name_len);
 
     // Resolve param names (emits NEW_NAME to buf_ for new param names).
@@ -382,6 +456,7 @@ class TraceWriter {
     ev.ts = NowNs();
     ev.name_idx = idx;
     ev.call_id = call_id;
+    ev.parent_id = parent_id;
     ev.type = kTraceFuncEnter;
     ev.is_async = (uint8_t)(is_async ? 1 : 0);
     ev.param_count = (uint8_t)pc;
@@ -431,6 +506,9 @@ class TraceWriter {
   __attribute__((noinline)) void WriteAsyncResume(
       const void* sfi_key, const char* name, int name_len) {
     uint32_t call_id = next_call_id_++;
+    uint32_t parent_id = call_stack_.empty()
+                             ? kNoCallId
+                             : call_stack_.back().call_id;
     uint32_t idx = EnsureNamed(sfi_key, name, name_len);
     uint64_t ts = NowNs();
     call_stack_.push_back({call_id, sfi_key, idx});
@@ -438,7 +516,27 @@ class TraceWriter {
     ev.ts = ts;
     ev.name_idx = idx;
     ev.call_id = call_id;
+    ev.parent_id = parent_id;
     ev.type = kTraceAsyncResume;
+    stage_.push_back(ev);
+  }
+
+  // Stage a META event.  holder_id is the call_id of the frame the metadata
+  // belongs to (kNoCallId when emitted outside any JS call).
+  // For type_tag == 5 (string), value is the name_idx of the interned string
+  // content (see InternString).  For 2/3/4 value is the primitive payload.
+  // For all other tags value is ignored.
+  __attribute__((noinline)) void WriteMeta(uint32_t holder_id,
+                                            uint32_t key_name_idx,
+                                            uint8_t  type_tag,
+                                            uint64_t value) {
+    StagedEvent ev;
+    ev.ts        = NowNs();
+    ev.type      = kTraceMeta;
+    ev.call_id   = holder_id;      // holder_id shares call_id slot
+    ev.name_idx  = key_name_idx;   // key name shares name_idx slot
+    ev.meta_tag  = type_tag;
+    ev.meta_value= value;
     stage_.push_back(ev);
   }
 
@@ -654,6 +752,12 @@ class TraceWriter {
         pending += e.batch_count;
         if (prev_e_ts < pending_min_ts) pending_min_ts = prev_e_ts;
         if (e.ts > pending_max_ts) pending_max_ts = e.ts;
+      } else if (e.type == kTraceMeta) {
+        // Metadata is always kept.  Its holder_id may reference a call that
+        // was throttled out; that's fine — the consumer surfaces it as an
+        // orphan-holder annotation rather than dropping the fact silently.
+        emit_pending(e.ts);
+        EmitStagedToBuf(e);
       }
       prev_e_ts = e.ts;
     }
@@ -695,7 +799,7 @@ class TraceWriter {
     }
     EnsureSpace();
     WriteHeader(kTraceFuncEnter, start_ts);
-    W4(idx); W1(0); W4(call_id); W1(0);  // param_count = 0
+    W4(idx); W4(kNoCallId); W1(0); W4(call_id); W1(0);  // parent=none, param_count=0
     EnsureSpace();
     WriteHeader(kTraceFuncExit, end_ts);
     W4(idx); W4(call_id);
@@ -799,15 +903,26 @@ class TraceWriter {
   // One entry per event staged for the current 100ms window.
   // NEW_NAME events are emitted directly to buf_ (never staged) so new_name
   // is not needed here.
+  //
+  // Field re-use across event types:
+  //   ENTER / RESUME: parent_id = enclosing call's call_id, kNoCallId if root.
+  //   META:           call_id   = holder_id (call_id of the annotated frame,
+  //                               kNoCallId if none),
+  //                   name_idx  = key_name_idx,
+  //                   meta_tag  = type_tag,
+  //                   meta_value= u64 payload (or interned string name_idx).
   struct StagedEvent {
     uint64_t       ts          = 0;
     uint32_t       name_idx    = 0;
     uint32_t       call_id     = 0;
+    uint32_t       parent_id   = kNoCallId;
     uint32_t       batch_count = 0;
+    uint64_t       meta_value  = 0;
     TraceEventType type        = kTraceFuncEnter;
     uint8_t        is_async    = 0;
     uint8_t        param_count = 0;
-    uint8_t        _pad        = 0;
+    uint8_t        meta_tag    = 0;
+    uint8_t        _pad[4]     = {};
     ParamSlot      params[kMaxParams];
   };
   std::vector<StagedEvent> stage_;
@@ -874,7 +989,7 @@ class TraceWriter {
     switch (ev.type) {
       case kTraceFuncEnter:
         WriteHeader(kTraceFuncEnter, ev.ts);
-        W4(ev.name_idx); W1(ev.is_async); W4(ev.call_id);
+        W4(ev.name_idx); W4(ev.parent_id); W1(ev.is_async); W4(ev.call_id);
         W1(ev.param_count);
         for (int i = 0; i < ev.param_count; i++) {
           const ParamSlot& p = ev.params[i];
@@ -885,9 +1000,12 @@ class TraceWriter {
             W4((uint32_t)(int32_t)(int64_t)p.value);  // i32, 4 bytes
         }
         break;
+      case kTraceAsyncResume:
+        WriteHeader(kTraceAsyncResume, ev.ts);
+        W4(ev.name_idx); W4(ev.parent_id); W4(ev.call_id);
+        break;
       case kTraceFuncExit:
       case kTraceAsyncSuspend:
-      case kTraceAsyncResume:
       case kTraceFuncOnStackReplacement:
         WriteHeader(ev.type, ev.ts);
         W4(ev.name_idx); W4(ev.call_id);
@@ -897,6 +1015,20 @@ class TraceWriter {
         W4(ev.batch_count);
         W8(prev_ts ? prev_ts : ev.ts);  // min_ts = end of last Ignition event
         W8(ev.ts);                       // max_ts = when batch was recorded
+        break;
+      case kTraceMeta:
+        WriteHeader(kTraceMeta, ev.ts);
+        W4(ev.call_id);     // holder_id
+        W4(ev.name_idx);    // key_name_idx
+        W1(ev.meta_tag);
+        // Payload matches wire format described in the file header comment.
+        if (ev.meta_tag == 2 || ev.meta_tag == 4) {
+          W8(ev.meta_value);
+        } else if (ev.meta_tag == 3) {
+          W4((uint32_t)(int32_t)(int64_t)ev.meta_value);
+        } else if (ev.meta_tag == 5) {
+          W4((uint32_t)ev.meta_value);   // name_idx of interned string
+        }
         break;
       default: break;
     }

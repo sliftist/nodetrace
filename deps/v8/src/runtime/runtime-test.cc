@@ -1782,6 +1782,66 @@ uint64_t g_turbofan_call_count = 0;
 // circular include or a separate translation unit for g_trace_writer.
 TraceWriter* GetGlobalTraceWriter() { return g_trace_writer; }
 
+// ── process.traceMeta(key, value) ────────────────────────────────────────────
+// Attaches a metadata key/value pair to the currently-executing call frame
+// (the top of the trace writer's call stack).  When tracing is disabled the
+// function is not installed at all; call sites should guard with
+// `process.traceMeta?.(key, value)` if they want to stay portable.
+static void TraceMetaCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  if (!g_trace_writer) return;
+  if (info.Length() < 1) return;
+  v8::Isolate* iso = info.GetIsolate();
+  v8::HandleScope hs(iso);
+  v8::Local<v8::Context> ctx = iso->GetCurrentContext();
+
+  v8::Local<v8::String> key_str;
+  if (!info[0]->ToString(ctx).ToLocal(&key_str)) return;
+  v8::String::Utf8Value key_utf8(iso, key_str);
+  if (!*key_utf8 || key_utf8.length() <= 0) return;
+  uint32_t key_len = key_utf8.length() > 65535 ? 65535
+                                               : static_cast<uint32_t>(key_utf8.length());
+  uint32_t key_idx = g_trace_writer->InternString(
+      static_cast<const void*>(*key_str), *key_utf8, key_len);
+
+  uint8_t  tag = 0;
+  uint64_t payload = 0;
+  v8::Local<v8::Value> val =
+      info.Length() >= 2 ? info[1] : v8::Local<v8::Value>();
+  if (val.IsEmpty() || val->IsUndefined())      { tag = 0; }
+  else if (val->IsNull())                       { tag = 1; }
+  else if (val->IsBoolean()) {
+    tag = 2;
+    payload = val.As<v8::Boolean>()->Value() ? 1 : 0;
+  } else if (val->IsNumber()) {
+    double d = val.As<v8::Number>()->Value();
+    int32_t i = static_cast<int32_t>(d);
+    if (static_cast<double>(i) == d) {
+      tag = 3;
+      payload = static_cast<uint64_t>(static_cast<int64_t>(i));
+    } else {
+      tag = 4;
+      memcpy(&payload, &d, 8);
+    }
+  } else if (val->IsString()) {
+    tag = 5;
+    v8::Local<v8::String> vs = val.As<v8::String>();
+    v8::String::Utf8Value vu(iso, vs);
+    int vlen = vu.length() < 0 ? 0 : vu.length();
+    if (vlen > 65535) vlen = 65535;
+    payload = g_trace_writer->InternString(
+        static_cast<const void*>(*vs),
+        *vu ? *vu : "", static_cast<uint32_t>(vlen));
+  }
+  else if (val->IsArray())    { tag = 7; }
+  else if (val->IsFunction()) { tag = 8; }
+  else if (val->IsSymbol())   { tag = 9; }
+  else if (val->IsBigInt())   { tag = 10; }
+  else if (val->IsObject())   { tag = 6; }
+  else                        { tag = 6; }
+
+  g_trace_writer->WriteMeta(g_trace_writer->TopCallId(), key_idx, tag, payload);
+}
+
 // Emit a OPTIMIZED_BATCH event if any TurboFan calls accumulated since the
 // last Ignition event.  Call this before every Write* on g_trace_writer.
 static inline void DrainOptimizedCount() {
@@ -1833,6 +1893,7 @@ RUNTIME_FUNCTION(Runtime_TraceEnter) {
         set_fn("trueTimeForceResync", [](const v8::FunctionCallbackInfo<v8::Value>& info) {
           info.GetReturnValue().Set(nodetrace::ForceResync());
         });
+        set_fn("traceMeta", TraceMetaCallback);
       }
     }
   }

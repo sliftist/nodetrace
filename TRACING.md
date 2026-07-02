@@ -110,6 +110,33 @@ Parameter names are interned the same way as function names — they share the
 same `names[]` array and the same monotonically-increasing index counter.
 `EV_NEWNAME` (0x06) events cover both function and parameter names.
 
+### Ad-hoc metadata: `process.traceMeta(key, value)`
+
+When tracing is enabled, `process.traceMeta(key, value)` emits a `META`
+record attached to the currently-executing call frame. Callers should
+`process.traceMeta?.(...)` to stay safe when tracing is off.
+
+```js
+function handleRequest(req) {
+  process.traceMeta?.('method', req.method);
+  process.traceMeta?.('url', req.url);
+  // ... work ...
+  process.traceMeta?.('itemsProcessed', 42);
+}
+```
+
+Values are typed via the same tag scheme as parameters (`undefined`, `null`,
+`boolean`, `integer`, `float`, `string`, `object`, `array`, `function`,
+`symbol`, `bigint`). Strings carry their content (interned into `names[]`);
+non-primitive types (`object`/`array`/`function`/`symbol`/`bigint`) record
+the type only.
+
+Metadata is **always kept** by the throttle pass — dropping the annotation
+because its holder call was throttled would silently lose information. When
+that happens the META arrives with a `holder_id` referencing a call that
+does not appear elsewhere in the file; consumers surface those as orphan
+annotations rather than treating them as errors.
+
 ## Wire format reference
 
 The binary trace is a flat stream of records. Records never cross a flush
@@ -118,11 +145,19 @@ boundary. See `deps/v8/src/trace/trace-writer.h` for the authoritative spec.
 All timestamps are **nanoseconds since Unix epoch** (same epoch as `Date.now()`).
 Divide by 1,000,000 to get milliseconds.
 
+### File header (v2, 8 bytes at offset 0)
+
+| Bytes | Field | Value |
+|-------|-------|-------|
+| 0..3  | magic   | ASCII `NTRC` |
+| 4..5  | version | u16-LE = `0x0002` |
+| 6..7  | flags   | u16-LE — bit 0 = params captured; other bits reserved |
+
 ### Record layout
 
 ```
 [uint8  header]   bits 7-6: ss (timestamp size selector)
-                  bits 5-0: type (event type, 0x00–0x06)
+                  bits 5-0: type (event type, 0x00–0x07)
 [delta]           timestamp delta from previous record, LE
                   ss=0 → 1 byte, ss=1 → 2 bytes, ss=2 → 4 bytes, ss=3 → 8 bytes
 [fields]          fixed layout per type — no per-field tags
@@ -136,12 +171,21 @@ Consecutive events typically differ by < 255 ns, so the delta fits in 1 byte.
 | Value | Name | Fields after header+delta |
 |-------|------|---------------------------|
 | 0x06 | NEW_NAME | name_idx(u32-LE), len(u16-LE), utf-8 bytes |
-| 0x00 | FUNC_ENTER | name_idx(u32-LE), is_async(u8), call_id(u32-LE), param_count(u8), [name_idx(u32-LE), type_tag(u8), value?(u64-LE)] × param_count |
+| 0x00 | FUNC_ENTER | name_idx(u32-LE), parent_id(u32-LE), is_async(u8), call_id(u32-LE), param_count(u8), [name_idx(u32-LE), type_tag(u8), value?(u64-LE)] × param_count |
 | 0x01 | FUNC_EXIT | name_idx(u32-LE), call_id(u32-LE) |
 | 0x02 | ASYNC_SUSPEND | name_idx(u32-LE), call_id(u32-LE) |
-| 0x03 | ASYNC_RESUME | name_idx(u32-LE), call_id(u32-LE) |
+| 0x03 | ASYNC_RESUME | name_idx(u32-LE), parent_id(u32-LE), call_id(u32-LE) |
 | 0x04 | FUNC_ON_STACK_REPLACEMENT | name_idx(u32-LE), call_id(u32-LE) |
 | 0x05 | OPTIMIZED_BATCH | count(u32-LE), min_ts(u64-LE), max_ts(u64-LE) |
+| 0x07 | META | holder_id(u32-LE), key_name_idx(u32-LE), type_tag(u8), payload? |
+
+`parent_id` = 0xFFFFFFFF (`NO_CALL_ID`) means "no parent" (root frame).
+`holder_id` = 0xFFFFFFFF means "no holder" (metadata emitted outside any
+JS call, e.g. before the first ENTER).
+
+META payloads follow the type_tag: 2 = u64 (bool), 3 = i32, 4 = u64
+(IEEE-754 double bits), 5 = u32 name_idx of the interned string content;
+all other tags carry no payload.
 
 **NEW_NAME** assigns a permanent string index. Always emitted immediately before
 the first event that references that `name_idx`; the following event has delta=0.
@@ -197,10 +241,13 @@ for throttled drops).
 | Event | Size |
 |-------|------|
 | NEW_NAME (len N) | 8+N bytes |
-| ENTER (no params) | 12 bytes |
-| ENTER (k params, all with value) | 12 + 13k bytes |
-| EXIT / SUSPEND / RESUME / ON_STACK_REPLACEMENT | 10 bytes |
+| ENTER (no params) | 16 bytes |
+| ENTER (k params, all with value) | 16 + 13k bytes |
+| RESUME | 14 bytes |
+| EXIT / SUSPEND / ON_STACK_REPLACEMENT | 10 bytes |
 | OPTIMIZED_BATCH | 22 bytes |
+| META (no payload) | 11 bytes |
+| META (u64 payload) | 19 bytes |
 
 ### Decoding
 

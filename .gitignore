@@ -38,6 +38,13 @@
 /*.exe
 /*.swp
 /out
+# nodetrace-fork local generated data
+/dumps/
+/samples/
+/serve-dumps/
+/*.bin
+/*-stack-depth.log
+/isolate-*-v8.log
 /*.msi
 /*.wixpdb
 /*.qlog
